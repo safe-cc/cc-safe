@@ -702,8 +702,12 @@ def probe_trace(proxy_url: str, timeout: int = 6) -> dict:
             f'proxy = "{_curl_esc_strict(proxy_url)}"\n'
             'url = "https://api.anthropic.com/cdn-cgi/trace"\n'
         )
+        curl_cmd = [CURL_BIN, "-s", "--noproxy", "", "--max-time", str(timeout)]
+        if IS_WINDOWS:
+            curl_cmd.append("--ssl-no-revoke")
+        curl_cmd += ["-K", "-"]
         res = subprocess.run(
-            [CURL_BIN, "-s", "--noproxy", "", "--max-time", str(timeout), "-K", "-"],
+            curl_cmd,
             input=cfg_stdin,
             capture_output=True,
             text=True,

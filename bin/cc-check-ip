@@ -167,6 +167,8 @@ def safe_curl(
     if body is not None:
         lines.append(f'data = "{_curl_esc_strict(body, allow_newlines=True)}"')
     cmd = [CURL_BIN, "-s", "--noproxy", "", "--max-time", str(timeout)]
+    if IS_WINDOWS:
+        cmd.append("--ssl-no-revoke")
     if write_code_only:
         cmd += ["-o", os.devnull, "-w", "%{http_code}"]
     cmd += ["-K", "-"]
@@ -185,7 +187,13 @@ def detect_claude_ver() -> str:
     )
     for cand in cands:
         try:
-            r = subprocess.run([cand, "--version"], capture_output=True, text=True, timeout=3)
+            resolved = cand if os.path.isabs(cand) else (shutil.which(cand) or "")
+            if not resolved or not os.path.isfile(resolved):
+                continue
+            low_r = resolved.lower().replace("/", "\\")
+            if IS_WINDOWS and ("\\windowsapps\\" in low_r or "\\anthropicclaude\\" in low_r):
+                continue
+            r = subprocess.run([resolved, "--version"], capture_output=True, text=True, timeout=3)
             m = re.search(r"(\d+\.\d+\.\d+)", r.stdout or "")
             if m:
                 return m.group(1)

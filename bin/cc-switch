@@ -126,7 +126,7 @@ RESERVED_VERBS = {
     "kill", "kill-local", "clean-procs",
     "usage", "quota", "reset", "limit-reset",
     "doctor", "audit", "test-leak", "totp", "pass", "check-ip",
-    "ban", "unban", "set-peer", "win-proxy", "import-session",
+    "ban", "unban", "set-peer", "win-proxy", "import-session", "desktop", "chrome",
     "apply-local", "auto-sync", "sync", "sync-cred",
     "help", "-h", "--help", "version", "-v", "--version",
 }
@@ -159,7 +159,13 @@ def get_claude_version() -> str:
     )
     for cand in cands:
         try:
-            r = subprocess.run([cand, "--version"], capture_output=True, text=True, timeout=5)
+            resolved = cand if os.path.isabs(cand) else (shutil.which(cand) or "")
+            if not resolved or not os.path.isfile(resolved):
+                continue
+            low_r = resolved.lower().replace("/", "\\")
+            if IS_WINDOWS and ("\\windowsapps\\" in low_r or "\\anthropicclaude\\" in low_r):
+                continue
+            r = subprocess.run([resolved, "--version"], capture_output=True, text=True, timeout=5)
             m = re.search(r"(\d+\.\d+\.\d+)", r.stdout or "")
             if m:
                 _CACHED_CLAUDE_VER = m.group(1)
@@ -246,8 +252,12 @@ def safe_curl(
     if body is not None:
         lines.append(f'data = "{_curl_esc(body, allow_newlines=True)}"')
     try:
+        curl_cmd = [CURL_BIN, "-s", "--noproxy", "", "--max-time", str(timeout)]
+        if IS_WINDOWS:
+            curl_cmd.append("--ssl-no-revoke")
+        curl_cmd += ["-K", "-"]
         res = subprocess.run(
-            [CURL_BIN, "-s", "--noproxy", "", "--max-time", str(timeout), "-K", "-"],
+            curl_cmd,
             input="\n".join(lines) + "\n",
             capture_output=True,
             text=True,
@@ -3445,6 +3455,14 @@ def main():
         clean_args = [a for a in args[1:] if a != "--quiet"]
         target_a = clean_args[0] if clean_args else None
         cmd_sync(target_acc=target_a, quiet=("--quiet" in args), cred_only=False)
+    elif args[0] in ("desktop", "chrome"):
+        if not IS_WINDOWS:
+            print(f"⚠️  `{args[0]}` 为 Windows 原生图形客户端隔离启动命令；请在 Windows 上运行 `cc-{args[0]}`。", file=sys.stderr)
+            sys.exit(1)
+        win_launcher = os.path.join(SAFE_DIR, "libexec", "py", "cc_win_launcher.py")
+        if not os.path.isfile(win_launcher):
+            win_launcher = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "windows", "cc_win_launcher.py")
+        sys.exit(subprocess.call([sys.executable, win_launcher, args[0], *args[1:]]))
     elif args[0] == "add":
         clean_args = [a for a in args[1:] if a != "--force"]
         if not clean_args:

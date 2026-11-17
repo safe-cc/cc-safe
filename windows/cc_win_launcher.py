@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """
 cc_win_launcher.py — Native Windows Isolation Supervisor & Helper Suite for cc-safe
-Provides four modes invoked by .cmd/.ps1 shims in %USERPROFILE%\\.local\\bin:
+Provides five modes invoked by .cmd/.ps1 shims in %USERPROFILE%\\.local\\bin:
   1. safe    (cc-safe)        : Fail-Close dual-channel US residential IP check + isolated CLAUDE_CONFIG_DIR
                                 + Windows NT Job Object (JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE) orphan containment
-                                + Live 3s Gost tunnel kill-switch watchdog + non-expiring OAuth login watcher
-  2. sub2api (claude-sub2api) : Physically separated relay launcher locked to %USERPROFILE%\\.claude
-  3. totp    (cc-totp)        : 6-digit 2FA TOTP helper
-  4. chrome  (cc-chrome)      : One-click isolated Chrome/Edge OAuth browser with remote-only DNS & QUIC disabled
+                                + Live 1s Gost tunnel kill-switch watchdog + non-expiring OAuth login watcher
+  2. desktop (cc-desktop)     : Native Claude Desktop (Claude.exe MSIX/Squirrel) GUI isolation wrapper with
+                                per-account ant-did (LOCALAPPDATA/APPDATA/--user-data-dir), forced proxy + remote DNS,
+                                tray residual clean-sweep, and Live 1s Job Object kill-switch watchdog
+  3. sub2api (claude-sub2api) : Physically separated relay launcher locked to %USERPROFILE%\\.claude
+  4. totp    (cc-totp)        : 6-digit 2FA TOTP helper
+  5. chrome  (cc-chrome)      : One-click isolated Chrome/Edge OAuth browser with remote-only DNS & QUIC disabled
 """
 import ctypes
+import glob
 import json
 import os
 import re
@@ -112,8 +116,31 @@ def _get_k32():
         k32.SetInformationJobObject.restype = wintypes.BOOL
         k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
         k32.AssignProcessToJobObject.restype = wintypes.BOOL
+        k32.QueryInformationJobObject.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        k32.QueryInformationJobObject.restype = wintypes.BOOL
         k32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
         k32.TerminateJobObject.restype = wintypes.BOOL
+        k32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        k32.TerminateProcess.restype = wintypes.BOOL
+        k32.QueryFullProcessImageNameW.argtypes = [
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            wintypes.LPWSTR,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        k32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+        k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        k32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+        k32.Process32FirstW.restype = wintypes.BOOL
+        k32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+        k32.Process32NextW.restype = wintypes.BOOL
         _get_k32._configured = True
     return k32
 
@@ -128,6 +155,79 @@ def _find_curl_bin() -> str:
     return shutil.which("curl") or "curl"
 
 
+def _is_desktop_gui_path(path: str) -> bool:
+    low = (path or "").lower().replace("/", "\\")
+    return "\\windowsapps\\" in low or "\\anthropicclaude\\" in low
+
+
+def _auto_install_claude_via_proxy(proxy_http_url: str) -> str:
+    if not IS_WINDOWS or not proxy_http_url:
+        return ""
+    import hashlib
+    import platform as _plat
+
+    mach = (_plat.machine() or "").lower()
+    plat_key = "win32-arm64" if "arm" in mach else "win32-x64"
+    base_url = "https://downloads.claude.ai/claude-code-releases"
+    curl_bin = _find_curl_bin()
+    os.makedirs(LOCAL_BIN, exist_ok=True)
+    tmp_exe = os.path.join(SAFE_DIR, "runtime", f"claude_dl_{os.getpid()}.exe.tmp")
+    os.makedirs(os.path.dirname(tmp_exe), exist_ok=True)
+    print(f"⬇️  [CC-Guard] 检测到尚未安装 claude.exe，正在通过已核验美国专线 ({proxy_http_url}) 自动下载安装...", file=sys.stderr)
+    try:
+        cfg_ver = f'noproxy = ""\nproxy = "{_curl_esc_strict(proxy_http_url)}"\nurl = "{base_url}/latest"\n'
+        r_ver = subprocess.run(
+            [curl_bin, "--ssl-no-revoke", "-fsSL", "--noproxy", "", "--max-time", "12", "-K", "-"],
+            input=cfg_ver,
+            capture_output=True,
+            text=True,
+            timeout=16,
+        )
+        ver = (r_ver.stdout or "").strip()
+        if not re.match(r"^\d+\.\d+\.\d+", ver):
+            return ""
+        cfg_man = f'noproxy = ""\nproxy = "{_curl_esc_strict(proxy_http_url)}"\nurl = "{base_url}/{ver}/manifest.json"\n'
+        r_man = subprocess.run(
+            [curl_bin, "--ssl-no-revoke", "-fsSL", "--noproxy", "", "--max-time", "15", "-K", "-"],
+            input=cfg_man,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        manifest = json.loads(r_man.stdout or "{}")
+        exp_sha = str((((manifest.get("platforms") or {}).get(plat_key)) or {}).get("checksum") or "").strip().lower()
+        if not re.match(r"^[0-9a-f]{64}$", exp_sha):
+            return ""
+        cfg_bin = f'noproxy = ""\nproxy = "{_curl_esc_strict(proxy_http_url)}"\nurl = "{base_url}/{ver}/{plat_key}/claude.exe"\n'
+        r_dl = subprocess.run(
+            [curl_bin, "--ssl-no-revoke", "--retry", "2", "-fSL", "--noproxy", "", "-o", tmp_exe, "-K", "-"],
+            input=cfg_bin,
+            timeout=600,
+        )
+        if r_dl.returncode != 0 or not os.path.isfile(tmp_exe):
+            return ""
+        h = hashlib.sha256()
+        with open(tmp_exe, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        if h.hexdigest().lower() != exp_sha:
+            print("❌ [CC-Guard] claude.exe SHA-256 校验失败，已丢弃文件。", file=sys.stderr)
+            return ""
+        dst_exe = os.path.join(LOCAL_BIN, "claude.exe")
+        os.replace(tmp_exe, dst_exe)
+        print(f"✅ [CC-Guard] Claude Code CLI v{ver} 已通过美国专线自动安装完成: {dst_exe}", file=sys.stderr)
+        return dst_exe
+    except Exception as exc:
+        print(f"⚠️  [CC-Guard] 自动下载 claude.exe 未成功: {exc}", file=sys.stderr)
+        return ""
+    finally:
+        if os.path.exists(tmp_exe):
+            try:
+                os.remove(tmp_exe)
+            except Exception:
+                pass
+
+
 def _find_claude_bin() -> str:
     env_override = os.environ.get("CLAUDE_BIN", "").strip()
     if env_override and os.path.isfile(env_override):
@@ -139,14 +239,13 @@ def _find_claude_bin() -> str:
             LOCAL_BIN,
             os.path.join(os.environ.get("APPDATA", ""), "npm"),
             os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "claude-code"),
-            os.path.join(os.environ.get("LOCALAPPDATA", ""), "AnthropicClaude"),
         ):
             if d:
                 for nm in ("claude.exe", "claude.cmd"):
                     candidates.append(os.path.join(d, nm))
         for nm in ("claude.exe", "claude.cmd", "claude"):
             w = shutil.which(nm)
-            if w and "cc-safe" not in os.path.basename(w).lower():
+            if w and "cc-safe" not in os.path.basename(w).lower() and not _is_desktop_gui_path(w):
                 candidates.append(w)
     else:
         candidates.append(os.path.join(LOCAL_BIN, "claude"))
@@ -155,7 +254,7 @@ def _find_claude_bin() -> str:
             candidates.append(w)
 
     for c in candidates:
-        if c and os.path.isfile(c):
+        if c and os.path.isfile(c) and not (IS_WINDOWS and _is_desktop_gui_path(c)):
             return c
     return ""
 
@@ -274,6 +373,38 @@ def _assign_pid_to_job(h_job, pid: int):
         pass
 
 
+def _get_job_active_processes(h_job) -> int:
+    if not IS_WINDOWS or not h_job:
+        return 0
+    try:
+        class JOBOBJECT_BASIC_ACCOUNTING_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("TotalUserTime", ctypes.c_longlong),
+                ("TotalKernelTime", ctypes.c_longlong),
+                ("ThisPeriodTotalUserTime", ctypes.c_longlong),
+                ("ThisPeriodTotalKernelTime", ctypes.c_longlong),
+                ("TotalPageFaultCount", wintypes.DWORD),
+                ("TotalProcesses", wintypes.DWORD),
+                ("ActiveProcesses", wintypes.DWORD),
+                ("TotalTerminatedProcesses", wintypes.DWORD),
+            ]
+
+        acct = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION()
+        ret_len = wintypes.DWORD(0)
+        JobObjectBasicAccountingInformation = 1
+        if _get_k32().QueryInformationJobObject(
+            h_job,
+            JobObjectBasicAccountingInformation,
+            ctypes.byref(acct),
+            ctypes.sizeof(acct),
+            ctypes.byref(ret_len),
+        ):
+            return int(acct.ActiveProcesses)
+    except Exception:
+        pass
+    return 0
+
+
 def _terminate_job(h_job, exit_code: int = 1):
     if not IS_WINDOWS or not h_job:
         return
@@ -307,8 +438,12 @@ def _probe_trace(proxy_url: str, timeout: int = 6) -> dict:
         'url = "https://api.anthropic.com/cdn-cgi/trace"\n'
     )
     try:
+        curl_cmd = [curl_bin, "-s", "--noproxy", "", "--max-time", str(timeout)]
+        if IS_WINDOWS:
+            curl_cmd.append("--ssl-no-revoke")
+        curl_cmd += ["-K", "-"]
         res = subprocess.run(
-            [curl_bin, "-s", "--noproxy", "", "--max-time", str(timeout), "-K", "-"],
+            curl_cmd,
             input=cfg_stdin,
             capture_output=True,
             text=True,
@@ -408,11 +543,6 @@ def run_safe(claude_args: list) -> int:
         print(f"❌ [CC-Guard 熔断] 账号 [{active_acc}] 未绑定明确的静态住宅 EXPECTED_IP，拒绝启动！", file=sys.stderr)
         return 1
 
-    claude_bin = _find_claude_bin()
-    if not claude_bin:
-        print("❌ [CC-Guard] 未找到 Claude Code CLI (claude.exe)，请重新运行 .\\install.ps1 自动安装。", file=sys.stderr)
-        return 1
-
     sw_py = _resolve_py_tool("cc-switch")
     tun_py = _resolve_py_tool("cc-us-tunnel")
 
@@ -445,6 +575,13 @@ def run_safe(claude_args: list) -> int:
             f"❌ [严重警告] SOCKS5h 隧道出口异常 (LOC={tr_s.get('loc') or '超时'}, IP={tr_s.get('ip') or '无'}, 绑定={expected_ip})！",
             file=sys.stderr,
         )
+        return 1
+
+    claude_bin = _find_claude_bin()
+    if not claude_bin and IS_WINDOWS and not os.environ.get("CLAUDE_BIN", "").strip():
+        claude_bin = _auto_install_claude_via_proxy(proxy_http_url)
+    if not claude_bin:
+        print("❌ [CC-Guard] 未找到 Claude Code CLI (claude.exe)，请重新运行 .\\install.ps1 自动安装。", file=sys.stderr)
         return 1
 
     prof_dir = os.path.join(SAFE_DIR, "profiles", active_acc)
@@ -909,14 +1046,459 @@ def run_chrome(args: list) -> int:
     return 0
 
 
+def _find_claude_desktop_bin() -> str:
+    env_override = os.environ.get("CC_DESKTOP_BIN", "").strip()
+    if env_override and os.path.isfile(env_override):
+        return env_override
+    if not IS_WINDOWS:
+        return ""
+
+    cands = []
+    # 1. MSIX / Store 安装包 (优先定位真实 <InstallLocation>\app\Claude.exe，绕过 WindowsApps 单实例转发桩)
+    try:
+        ps = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                '(Get-AppxPackage -Name "*Claude*" | Sort-Object Version -Descending | Select-Object -First 1).InstallLocation',
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        iloc = (ps.stdout or "").strip()
+        if iloc and os.path.isdir(iloc):
+            cands.append(os.path.join(iloc, "app", "Claude.exe"))
+            cands.append(os.path.join(iloc, "Claude.exe"))
+    except Exception:
+        pass
+
+    pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+    for g in sorted(glob.glob(os.path.join(pf, "WindowsApps", "Claude_*", "app", "Claude.exe")), reverse=True):
+        cands.append(g)
+
+    # 2. Squirrel / 独立 EXE 安装包 (优先定位 app-<ver>\claude.exe 主进程二进制，避免 Update.exe 桩脱离作业对象)
+    lad = os.environ.get("LOCALAPPDATA", "")
+    if lad:
+        squirrel_apps = sorted(
+            glob.glob(os.path.join(lad, "AnthropicClaude", "app-*", "claude.exe"))
+            + glob.glob(os.path.join(lad, "AnthropicClaude", "app-*", "Claude.exe")),
+            reverse=True,
+        )
+        cands.extend(squirrel_apps)
+        cands.append(os.path.join(lad, "AnthropicClaude", "claude.exe"))
+        cands.append(os.path.join(lad, "Programs", "Claude", "Claude.exe"))
+        cands.append(os.path.join(lad, "Microsoft", "WindowsApps", "Claude.exe"))
+
+    cands.append(os.path.join(pf, "Claude", "Claude.exe"))
+    for c in cands:
+        if c and os.path.isfile(c):
+            return c
+    return ""
+
+
+def _kill_unmanaged_desktop_procs(exclude_pids: set = None) -> int:
+    """启动隔离桌面端前，清理后台/系统托盘中残留的裸跑或异号 Claude.exe 桌面端进程，防止单实例锁与 claude:// 串号。"""
+    if not IS_WINDOWS or os.environ.get("CC_AUDIT_SANDBOX") == "1":
+        return 0
+    excl = set(exclude_pids or ())
+    excl.add(os.getpid())
+    killed = 0
+    try:
+        k32 = _get_k32()
+        TH32CS_SNAPPROCESS = 0x00000002
+        INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.c_size_t),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", wintypes.LONG),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", wintypes.WCHAR * 260),
+            ]
+
+        pids_to_kill = []
+        snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if snap and snap != INVALID_HANDLE_VALUE:
+            try:
+                pe = PROCESSENTRY32W()
+                pe.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+                if k32.Process32FirstW(snap, ctypes.byref(pe)):
+                    while True:
+                        pid = int(pe.th32ProcessID)
+                        if pid not in excl and pe.szExeFile.lower() == "claude.exe":
+                            hp = k32.OpenProcess(0x1000, False, pid)
+                            if hp:
+                                try:
+                                    buf = ctypes.create_unicode_buffer(1024)
+                                    sz = wintypes.DWORD(1024)
+                                    if k32.QueryFullProcessImageNameW(hp, 0, buf, ctypes.byref(sz)):
+                                        low_img = buf.value.lower().replace("/", "\\")
+                                        if (
+                                            "\\windowsapps\\claude" in low_img
+                                            or "\\anthropicclaude\\" in low_img
+                                            or "\\programs\\claude\\" in low_img
+                                        ):
+                                            pids_to_kill.append(pid)
+                                finally:
+                                    k32.CloseHandle(hp)
+                        if not k32.Process32NextW(snap, ctypes.byref(pe)):
+                            break
+            finally:
+                k32.CloseHandle(snap)
+
+        for pid in pids_to_kill:
+            hp = k32.OpenProcess(0x0001, False, pid)
+            if hp:
+                try:
+                    if k32.TerminateProcess(hp, 1):
+                        killed += 1
+                finally:
+                    k32.CloseHandle(hp)
+        if killed:
+            time.sleep(0.4)
+    except Exception:
+        pass
+    return killed
+
+
+def run_desktop(args: list) -> int:
+    if not os.path.isfile(ACCOUNTS_FILE):
+        print("❌ [CC-Desktop] 未找到 accounts.json，请先运行 `cc-switch init` 添加账号。", file=sys.stderr)
+        return 1
+    try:
+        with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        if not isinstance(d, dict):
+            raise ValueError("root is not JSON object")
+    except Exception as e:
+        print(f"❌ [CC-Desktop] 读取 accounts.json 失败: {e}", file=sys.stderr)
+        return 1
+
+    accs = d.get("accounts") or {}
+    no_chrome_hint = "--no-chrome" in args
+    filtered_args = [a for a in args if a != "--no-chrome"]
+
+    extra_electron_args = []
+    if filtered_args and not filtered_args[0].startswith("-"):
+        raw_target = filtered_args[0].strip()
+        extra_electron_args = filtered_args[1:]
+    else:
+        raw_target = str(d.get("active") or "").strip()
+        extra_electron_args = filtered_args
+
+    target = raw_target
+    if target and target not in accs and "@" in target:
+        for k_cand, v_cand in accs.items():
+            if isinstance(v_cand, dict) and str(v_cand.get("email") or "").strip().lower() == target.lower():
+                target = k_cand
+                break
+
+    if not target or target not in accs:
+        print(f"❌ [CC-Desktop] 未找到目标账号 '{raw_target}'。用法: cc-desktop [账号别名或邮箱]", file=sys.stderr)
+        return 1
+    if d.get("active") != target:
+        print(f"⚠️  账号 [{target}] 当前未激活！请先运行 `cc-switch {target}` 切换专线后再启动 Claude Desktop。", file=sys.stderr)
+        return 1
+
+    meta = _read_active_meta()
+    if not meta.get("ok") or meta.get("account") != target:
+        print("❌ [CC-Desktop 熔断] 账号配置异常，拒绝启动！", file=sys.stderr)
+        return 1
+    if meta["status"] == "banned":
+        print(f"🚫 [CC-Desktop 熔断] 账号 [{target}] 已处于封禁 (banned) 状态，严禁启动桌面客户端！", file=sys.stderr)
+        return 1
+    expected_ip = meta["ip"]
+    if not expected_ip or expected_ip == "未知":
+        print(f"❌ [CC-Desktop 熔断] 账号 [{target}] 未绑定 EXPECTED_IP，拒绝启动！", file=sys.stderr)
+        return 1
+
+    desktop_bin = _find_claude_desktop_bin()
+    if not desktop_bin:
+        print("❌ [CC-Desktop] 未检测到 Windows 版 Claude Desktop 客户端 (Claude.exe)！", file=sys.stderr)
+        print("   请先从 https://claude.ai/download 安装官方桌面客户端，再使用 `cc-desktop` 启动。", file=sys.stderr)
+        return 1
+
+    clean_helper_env = dict(os.environ)
+    _pop_env_ci(clean_helper_env, ("CC_SAFE_MANAGED", "CC_SAFE_ACCOUNT", "NO_PROXY"))
+    sw_py = _resolve_py_tool("cc-switch")
+    tun_py = _resolve_py_tool("cc-us-tunnel")
+    if os.path.isfile(tun_py):
+        if subprocess.run([sys.executable, tun_py, "ensure"], env=clean_helper_env).returncode != 0:
+            print("❌ [CC-Desktop 熔断] 本地美国家宽隧道启动失败！", file=sys.stderr)
+            return 1
+
+    http_listen, socks_listen, proxy_http_url, proxy_socks_url = _get_tunnel_endpoints()
+    h_host, h_port = _split_listen_addr(http_listen)
+    s_host, s_port = _split_listen_addr(socks_listen)
+
+    print(f"🔍 [CC-Desktop] 正在核验账号 [{target}] 桌面端专属隧道 (HTTP+SOCKS5h -> {expected_ip})...")
+    tr_h = _probe_trace(proxy_http_url, timeout=6)
+    if tr_h.get("loc") != "US" or tr_h.get("ip") != expected_ip:
+        print(
+            f"❌ [Fail-Close] HTTP 出口核验未通过 (实际={tr_h.get('ip') or '无'} / {tr_h.get('loc') or '超时'}, 绑定={expected_ip})！已阻断桌面端启动。",
+            file=sys.stderr,
+        )
+        return 1
+    tr_s = _probe_trace(proxy_socks_url, timeout=6)
+    if tr_s.get("loc") != "US" or tr_s.get("ip") != expected_ip:
+        print(
+            f"❌ [Fail-Close] SOCKS5h 出口核验未通过 (实际={tr_s.get('ip') or '无'} / {tr_s.get('loc') or '超时'}, 绑定={expected_ip})！已阻断桌面端启动。",
+            file=sys.stderr,
+        )
+        return 1
+
+    if os.path.isfile(sw_py):
+        subprocess.run(
+            [sys.executable, sw_py, "apply-local", target, "--if-idle"],
+            env=clean_helper_env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    killed_tray = _kill_unmanaged_desktop_procs()
+    if killed_tray:
+        print(f"🧹 已自动清理 {killed_tray} 个后台/托盘残留的 Claude.exe 进程，严防单实例锁串号。")
+
+    prof_dir = os.path.join(SAFE_DIR, "profiles", target)
+    prof_cli_home = os.path.join(prof_dir, "home")
+    desk_root = os.path.join(prof_dir, "desktop")
+    desk_home = os.path.join(desk_root, "home")
+    desk_user_data = os.path.join(desk_root, "user-data")
+    desk_roaming = os.path.join(desk_root, "AppData", "Roaming")
+    desk_local = os.path.join(desk_root, "AppData", "Local")
+    desk_claude_cfg_dir = os.path.join(desk_roaming, "Claude")
+    desk_claude_data_dir = os.path.join(desk_local, "Claude-Data")
+    for _dd in (prof_cli_home, desk_home, desk_user_data, desk_roaming, desk_local, desk_claude_cfg_dir, desk_claude_data_dir):
+        os.makedirs(_dd, mode=0o700, exist_ok=True)
+
+    desk_cfg_json = os.path.join(desk_claude_cfg_dir, "claude_desktop_config.json")
+    if not os.path.exists(desk_cfg_json):
+        with open(desk_cfg_json, "wb") as cf:
+            cf.write(b"{}\n")
+
+    run_env = dict(os.environ)
+    _pop_env_ci(
+        run_env,
+        (
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_CUSTOM_HEADERS",
+            "CLAUDE_SUB2API_MANAGED",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_ENABLE_TELEMETRY",
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "OTEL_EXPORTER_OTLP_HEADERS",
+            "CLAUDE_CODE_ORGANIZATION_UUID",
+            "CLAUDE_CODE_ACCOUNT_UUID",
+            "HTTPS_PROXY",
+            "HTTP_PROXY",
+            "ALL_PROXY",
+            "GRPC_PROXY",
+            "NO_PROXY",
+            "HOME",
+            "USERPROFILE",
+            "APPDATA",
+            "LOCALAPPDATA",
+        ),
+    )
+
+    libexec_dir = os.path.join(SAFE_DIR, "libexec")
+    cur_path = _get_env_ci(run_env, "PATH")
+    _pop_env_ci(run_env, ("PATH",))
+    run_env["PATH"] = (libexec_dir + os.pathsep + cur_path) if os.path.isdir(libexec_dir) else cur_path
+
+    gitconfig_p = os.path.join(prof_dir, "gitconfig")
+    _pop_env_ci(
+        run_env,
+        ("GIT_CONFIG_GLOBAL", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "EMAIL"),
+    )
+    if os.path.isfile(gitconfig_p):
+        run_env["GIT_CONFIG_GLOBAL"] = gitconfig_p
+        run_env["GIT_AUTHOR_NAME"] = meta["git_user"]
+        run_env["GIT_AUTHOR_EMAIL"] = meta["git_email"]
+        run_env["GIT_COMMITTER_NAME"] = meta["git_user"]
+        run_env["GIT_COMMITTER_EMAIL"] = meta["git_email"]
+        run_env["EMAIL"] = meta["git_email"]
+
+    run_env.update(
+        {
+            "HOME": desk_home,
+            "USERPROFILE": desk_home,
+            "APPDATA": desk_roaming,
+            "LOCALAPPDATA": desk_local,
+            "CC_SAFE_MANAGED": "1",
+            "CC_SAFE_ACCOUNT": target,
+            "CC_SAFE_ROOT": SAFE_DIR,
+            "CLAUDE_CONFIG_DIR": prof_cli_home,
+            "CLAUDE_SECURESTORAGE_CONFIG_DIR": prof_cli_home,
+            "ANTHROPIC_CONFIG_DIR": prof_cli_home,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "TZ": meta["tz"],
+            "HTTPS_PROXY": proxy_http_url,
+            "https_proxy": proxy_http_url,
+            "HTTP_PROXY": proxy_http_url,
+            "http_proxy": proxy_http_url,
+            "ALL_PROXY": proxy_socks_url,
+            "all_proxy": proxy_socks_url,
+            "GRPC_PROXY": proxy_http_url,
+            "grpc_proxy": proxy_http_url,
+            "NO_PROXY": "localhost,127.0.0.1,::1",
+            "no_proxy": "localhost,127.0.0.1,::1",
+            "NODE_OPTIONS": "--dns-result-order=ipv4first",
+            "BUN_FEATURE_FLAG_DISABLE_IPV6": "1",
+            "DISABLE_TELEMETRY": "1",
+            "DO_NOT_TRACK": "1",
+            "DISABLE_ERROR_REPORTING": "1",
+            "DISABLE_AUTOUPDATER": "1",
+            "DISABLE_GROWTHBOOK": "1",
+        }
+    )
+
+    excl_hosts = "EXCLUDE 127.0.0.1 , EXCLUDE localhost"
+    if h_host not in ("127.0.0.1", "localhost"):
+        excl_hosts += f" , EXCLUDE {h_host}"
+
+    d_args = [
+        desktop_bin,
+        f"--user-data-dir={desk_user_data}",
+        f"--proxy-server={proxy_http_url}",
+        "--proxy-bypass-list=<-loopback>",
+        f"--host-resolver-rules=MAP * ~NOTFOUND , {excl_hosts}",
+        "--disable-quic",
+        "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+        *extra_electron_args,
+    ]
+
+    cookie_cand1 = os.path.join(desk_user_data, "Network", "Cookies")
+    cookie_cand2 = os.path.join(desk_user_data, "Cookies")
+    has_logged_in = (os.path.isfile(cookie_cand1) and os.path.getsize(cookie_cand1) > 4096) or (
+        os.path.isfile(cookie_cand2) and os.path.getsize(cookie_cand2) > 4096
+    )
+
+    print(f"✅ [CC-Desktop] 账号: {target} | 出口 IP: {expected_ip} (US) | 时区: {meta['tz']}")
+    print(f"   独立设备指纹空间 (ant-did): {desk_root}")
+    if not has_logged_in and not no_chrome_hint and os.environ.get("CC_AUDIT_SANDBOX") != "1":
+        print("   💡 [首次登录防漏提示]：")
+        print(f"      1) 请先运行 `cc-chrome {target}` 打开同源美国 IP 隔离浏览器（若点击登录弹出了系统默认未代理浏览器，请立即关闭并把链接复制到隔离浏览器）；")
+        print("      2) 在隔离浏览器验证邮箱后，弹出 'Open Claude?' 时点【取消】，点击网页上的【Sign in with a code / 验证码登录】粘贴回桌面客户端！")
+    print("   🛡️ 1s 级断流熔断看门狗守护中（请保持本守护终端开启，关闭客户端及右下角托盘后自动退出）...")
+
+    initial_tunnel_hash = None
+    if os.path.isfile(TUNNEL_HASH_FILE):
+        try:
+            initial_tunnel_hash = open(TUNNEL_HASH_FILE, "r", encoding="utf-8").read().strip()
+        except Exception:
+            initial_tunnel_hash = None
+
+    h_job = _create_kill_on_close_job()
+    stop_evt = threading.Event()
+    killswitch_tripped = threading.Event()
+
+    proc = subprocess.Popen(d_args, env=run_env)
+    _assign_pid_to_job(h_job, proc.pid)
+
+    marker_file = _write_session_marker(
+        WIN_SESS_DIR,
+        {
+            "pid": os.getpid(),
+            "create_time": _get_win_proc_create_time(os.getpid()),
+            "claude_pid": proc.pid,
+            "claude_create_time": _get_win_proc_create_time(proc.pid),
+            "account": target,
+            "mode": "desktop",
+            "safe_root": SAFE_DIR,
+        },
+    )
+
+    def _desktop_killswitch():
+        fail_streak = 0
+        while not stop_evt.wait(1.0):
+            if proc.poll() is not None and _get_job_active_processes(h_job) == 0:
+                return
+            m_now = _read_active_meta()
+            if (
+                not m_now.get("ok")
+                or m_now.get("account") != target
+                or m_now.get("status") == "banned"
+                or m_now.get("ip") != expected_ip
+            ):
+                print("\n🛑 [CC-Desktop 实时熔断] 检测到账号已被切换或封禁，立即终止桌面端全部进程（含托盘）！", file=sys.stderr)
+                killswitch_tripped.set()
+                _terminate_job(h_job, 1)
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                return
+            if initial_tunnel_hash is not None:
+                cur_hash = None
+                try:
+                    if os.path.isfile(TUNNEL_HASH_FILE):
+                        cur_hash = open(TUNNEL_HASH_FILE, "r", encoding="utf-8").read().strip()
+                except Exception:
+                    cur_hash = None
+                if cur_hash != initial_tunnel_hash:
+                    print("\n🛑 [CC-Desktop 实时熔断] 检测到本地专线已停用或切换，立即终止桌面端严防串流泄漏！", file=sys.stderr)
+                    killswitch_tripped.set()
+                    _terminate_job(h_job, 1)
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    return
+            if not (_port_open(h_host, h_port) and _port_open(s_host, s_port)):
+                fail_streak += 1
+                if fail_streak >= 2:
+                    print("\n🛑 [CC-Desktop 实时熔断] 检测到本地 Gost 端口断开，立即阻断桌面端严防直连暴露！", file=sys.stderr)
+                    killswitch_tripped.set()
+                    _terminate_job(h_job, 1)
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    return
+            else:
+                fail_streak = 0
+
+    threading.Thread(target=_desktop_killswitch, daemon=True).start()
+    try:
+        rc = proc.wait()
+        if IS_WINDOWS and h_job and not killswitch_tripped.is_set():
+            while not killswitch_tripped.is_set() and _get_job_active_processes(h_job) > 0:
+                time.sleep(0.5)
+    except KeyboardInterrupt:
+        _terminate_job(h_job, 1)
+        rc = 130
+    finally:
+        stop_evt.set()
+        _remove_file_quiet(marker_file)
+        _terminate_job(h_job, 0)
+        _close_job(h_job)
+
+    return 1 if killswitch_tripped.is_set() else rc
+
+
 def main():
     if len(sys.argv) < 2:
-        print("Usage: cc_win_launcher.py <safe|sub2api|totp|chrome> [args...]", file=sys.stderr)
+        print("Usage: cc_win_launcher.py <safe|desktop|sub2api|totp|chrome> [args...]", file=sys.stderr)
         sys.exit(1)
     mode = sys.argv[1].lower()
     rest = sys.argv[2:]
     if mode == "safe":
         sys.exit(run_safe(rest))
+    elif mode == "desktop":
+        sys.exit(run_desktop(rest))
     elif mode == "sub2api":
         sys.exit(run_sub2api(rest))
     elif mode == "totp":

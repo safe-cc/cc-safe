@@ -24,7 +24,7 @@ try {
     Unregister-ScheduledTask -TaskName "cc-safe-tunnel-guard" -Confirm:$false -ErrorAction SilentlyContinue
 } catch {}
 
-foreach ($cmd in @("cc-switch.cmd", "cc-safe.cmd", "cc-us-tunnel.cmd", "cc-check-ip.cmd", "cc-totp.cmd", "cc-audit.cmd", "claude-sub2api.cmd", "cc-chrome.cmd")) {
+foreach ($cmd in @("cc-switch.cmd", "cc-safe.cmd", "cc-desktop.cmd", "cc-us-tunnel.cmd", "cc-check-ip.cmd", "cc-totp.cmd", "cc-audit.cmd", "claude-sub2api.cmd", "cc-chrome.cmd")) {
     $p = Join-Path $BinDst $cmd
     if (Test-Path -LiteralPath $p) {
         Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue

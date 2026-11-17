@@ -818,7 +818,7 @@ def run_full_audit(repo_dir: str) -> int:
         clean_net_env = {k: v for k, v in os.environ.items() if not k.upper().endswith("_PROXY")}
         if IS_WINDOWS:
             subprocess.run(
-                [CURL_BIN, "-s", "--noproxy", "", "-x", f"socks5h://127.0.0.1:{s_port}", "--max-time", "3", "http://canary-dns-audit.anthropic.invalid/ping"],
+                [CURL_BIN, "--ssl-no-revoke", "-s", "--noproxy", "", "-x", f"socks5h://127.0.0.1:{s_port}", "--max-time", "3", "http://canary-dns-audit.anthropic.invalid/ping"],
                 env=clean_net_env,
                 capture_output=True,
                 timeout=6,
@@ -826,7 +826,7 @@ def run_full_audit(repo_dir: str) -> int:
             t_socks.join(timeout=2)
             s_sock.close()
             closed_res = subprocess.run(
-                [CURL_BIN, "-s", "--noproxy", "", "-x", f"socks5h://127.0.0.1:{s_port}", "--max-time", "2", "http://198.51.100.1/"],
+                [CURL_BIN, "--ssl-no-revoke", "-s", "--noproxy", "", "-x", f"socks5h://127.0.0.1:{s_port}", "--max-time", "2", "http://198.51.100.1/"],
                 env=clean_net_env,
                 capture_output=True,
                 timeout=5,

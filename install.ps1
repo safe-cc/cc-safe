@@ -105,7 +105,13 @@ if ([string]::IsNullOrWhiteSpace($ScriptDir) -or -not (Test-Path -LiteralPath (J
         $TmpZip = Join-Path $SafeBase "repo_bootstrap.zip"
         $TmpExt = Join-Path $SafeBase "repo_extract_tmp"
         if (Test-Path -LiteralPath $TmpExt) { Remove-Item -LiteralPath $TmpExt -Recurse -Force }
-        Invoke-WebRequest -Uri $RepoZipUrl -OutFile $TmpZip -UseBasicParsing
+        $BootCurl = Join-Path $env:SystemRoot "System32\curl.exe"
+        if (Test-Path -LiteralPath $BootCurl) {
+            & $BootCurl --ssl-no-revoke --connect-timeout 15 --max-time 120 --retry 2 -fSL $RepoZipUrl -o $TmpZip
+            if ($LASTEXITCODE -ne 0) { Write-Error "❌ 下载 safe-cc/cc-safe 源码包失败 (curl 退出码: $LASTEXITCODE)"; exit 1 }
+        } else {
+            Invoke-WebRequest -Uri $RepoZipUrl -OutFile $TmpZip -UseBasicParsing
+        }
         Expand-Archive -LiteralPath $TmpZip -DestinationPath $TmpExt -Force
         Remove-Item -LiteralPath $TmpZip -Force -ErrorAction SilentlyContinue
         $Inner = Get-ChildItem -LiteralPath $TmpExt -Directory | Select-Object -First 1
@@ -189,6 +195,9 @@ if (-not (Test-Path -LiteralPath $SysCurl)) {
     Write-Error "❌ 未找到 $SysCurl (需要 Windows 10 1803+ 或 Windows 11)。"
     exit 1
 }
+# Windows System32\curl.exe 使用 Schannel，在国内/内网直连海外 OCSP 吊销服务器离线时会硬报错 (exit 35: 0x80092013)
+# --ssl-no-revoke 保留完整 TLS 证书链、CA 根与域名校验，仅关闭旁路 OCSP/CRL 直连阻塞
+$CurlWinArgs = @("--ssl-no-revoke", "--retry", "2", "--connect-timeout", "15", "-fSL")
 
 # ---------------------------------------------------------------------------
 # 2. 免管理员权限解析 / 自动部署独立 Python 3.12 运行时
@@ -233,10 +242,15 @@ if (-not $PythonExe) {
     $PyDst = Join-Path $RuntimeDir "python"
     if (Test-Path -LiteralPath $PyDst) { Remove-Item -LiteralPath $PyDst -Recurse -Force }
     $NugetUrl = "https://www.nuget.org/api/v2/package/$NugetPkg/$PyNugetVer"
-    & $SysCurl -fSL $NugetUrl -o $PyZip
-    if ($LASTEXITCODE -ne 0) {
-        Write-Error "❌ 下载独立版 Python 失败 (curl 退出码: $LASTEXITCODE)，请检查网络连接。"
-        exit 1
+    & $SysCurl @CurlWinArgs $NugetUrl -o $PyZip
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $PyZip)) {
+        Write-Host "⚠️  curl 下载 Python 未成功 (exit=$LASTEXITCODE)，切换 PowerShell TLS 通道重试..." -ForegroundColor Yellow
+        try {
+            Invoke-WebRequest -Uri $NugetUrl -OutFile $PyZip -UseBasicParsing
+        } catch {
+            Write-Error "❌ 下载独立版 Python 失败，请检查网络连接。"
+            exit 1
+        }
     }
     Expand-Archive -LiteralPath $PyZip -DestinationPath $PyDst -Force
     Remove-Item -LiteralPath $PyZip -Force -ErrorAction SilentlyContinue
@@ -289,10 +303,25 @@ if ($NeedGost) {
     $GostZip = Join-Path $RuntimeDir "gost_win.zip"
     $GostTmp = Join-Path $RuntimeDir "gost_tmp"
     if (Test-Path -LiteralPath $GostTmp) { Remove-Item -LiteralPath $GostTmp -Recurse -Force }
-    & $SysCurl -fSL $GostUrl -o $GostZip
-    if ($LASTEXITCODE -ne 0) {
-        Write-Error "❌ 下载 gost v3 失败 (curl 退出码: $LASTEXITCODE)，请检查网络连接。"
-        exit 1
+    if (Test-Path -LiteralPath $GostZip) { Remove-Item -LiteralPath $GostZip -Force -ErrorAction SilentlyContinue }
+    & $SysCurl @CurlWinArgs $GostUrl -o $GostZip
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $GostZip)) {
+        Write-Host "⚠️  curl 下载 gost 未成功 (exit=$LASTEXITCODE)，切换 Python/PowerShell TLS 通道重试..." -ForegroundColor Yellow
+        $oldEapDl = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = "Continue"
+            & $PythonExe -c "import sys, urllib.request; req=urllib.request.Request(sys.argv[1], headers={'User-Agent':'cc-safe-win'}); data=urllib.request.urlopen(req, timeout=60).read(); open(sys.argv[2],'wb').write(data)" $GostUrl $GostZip
+        } catch {} finally {
+            $ErrorActionPreference = $oldEapDl
+        }
+        if (-not (Test-Path -LiteralPath $GostZip) -or ((Get-Item -LiteralPath $GostZip).Length -lt 1024)) {
+            try {
+                Invoke-WebRequest -Uri $GostUrl -OutFile $GostZip -UseBasicParsing
+            } catch {
+                Write-Error "❌ 下载 gost v3 失败，请检查目标机器到 GitHub Releases 的网络连接。"
+                exit 1
+            }
+        }
     }
     if ($GostDigest -match '^sha256:([0-9a-fA-F]{64})$') {
         $ExpectedHash = $Matches[1]
@@ -318,11 +347,44 @@ if ($NeedGost) {
 $env:Path = "$BinDst;$env:Path"
 $HasClaude = [bool](Get-Command claude.exe -ErrorAction SilentlyContinue) -or [bool](Get-Command claude.cmd -ErrorAction SilentlyContinue) -or (Test-Path -LiteralPath (Join-Path $BinDst "claude.exe"))
 if (-not $SkipClaude -and -not $HasClaude) {
-    Write-Host "⬇️  未检测到 Claude Code CLI，正在执行官方 Windows 原生安装 ..." -ForegroundColor Cyan
+    Write-Host "⬇️  未检测到 Claude Code CLI，正在尝试自动下载官方 Windows 原生版 ..." -ForegroundColor Cyan
+    $ClaudePlat = if ($ArchTag -eq "arm64") { "win32-arm64" } else { "win32-x64" }
+    $ClaudeBase = "https://downloads.claude.ai/claude-code-releases"
+    $ClaudeProxyArgs = @()
     try {
-        Invoke-RestMethod -Uri "https://claude.ai/install.ps1" -UseBasicParsing | Invoke-Expression
-    } catch {
-        Write-Warning "Claude Code 自动安装未完成（若网络受限可稍后配置代理安装，或使用 npm i -g @anthropic-ai/claude-code）。"
+        if ((New-Object Net.Sockets.TcpClient).ConnectAsync("127.0.0.1", 7890).Wait(300)) {
+            $ClaudeProxyArgs = @("--noproxy", "", "-x", "http://127.0.0.1:7890")
+        }
+    } catch {}
+    $oldEapCc = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $CcVer = ((& $SysCurl --ssl-no-revoke -fsSL --max-time 10 @ClaudeProxyArgs "$ClaudeBase/latest" 2>$null) | Out-String).Trim()
+        if ($CcVer -match '^\d+\.\d+\.\d+') {
+            $CcManifestRaw = ((& $SysCurl --ssl-no-revoke -fsSL --max-time 12 @ClaudeProxyArgs "$ClaudeBase/$CcVer/manifest.json" 2>$null) | Out-String).Trim()
+            $CcManifest = $CcManifestRaw | ConvertFrom-Json
+            $CcExpectedSha = [string]$CcManifest.platforms.$ClaudePlat.checksum
+            if ($CcExpectedSha -match '^[0-9a-fA-F]{64}$') {
+                $CcTmpExe = Join-Path $RuntimeDir "claude_download.exe.tmp"
+                if (Test-Path -LiteralPath $CcTmpExe) { Remove-Item -LiteralPath $CcTmpExe -Force -ErrorAction SilentlyContinue }
+                & $SysCurl --ssl-no-revoke --retry 2 --connect-timeout 15 -fSL @ClaudeProxyArgs "$ClaudeBase/$CcVer/$ClaudePlat/claude.exe" -o $CcTmpExe
+                if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $CcTmpExe)) {
+                    $CcActualSha = (Get-FileHash -LiteralPath $CcTmpExe -Algorithm SHA256).Hash
+                    if ($CcActualSha -ieq $CcExpectedSha) {
+                        Move-Item -LiteralPath $CcTmpExe -Destination (Join-Path $BinDst "claude.exe") -Force
+                        Write-Host "✅ Claude Code CLI v$CcVer 已安装并通过 SHA-256 校验: $BinDst\claude.exe" -ForegroundColor Green
+                        $HasClaude = $true
+                    } else {
+                        Remove-Item -LiteralPath $CcTmpExe -Force -ErrorAction SilentlyContinue
+                    }
+                }
+            }
+        }
+    } catch {} finally {
+        $ErrorActionPreference = $oldEapCc
+    }
+    if (-not $HasClaude) {
+        Write-Warning "当前直连尚未拉取到 Claude Code CLI（添加美国代理账号后首次运行 cc-safe 将自动通过专线补齐安装）。"
     }
 }
 
@@ -355,6 +417,7 @@ Write-CmdShim "cc-us-tunnel"   (Join-Path $PyLibExec "cc-us-tunnel")
 Write-CmdShim "cc-check-ip"    (Join-Path $PyLibExec "cc-check-ip")
 Write-CmdShim "cc-audit"       (Join-Path $PyLibExec "cc-audit")
 Write-CmdShim "cc-safe"        (Join-Path $PyLibExec "cc_win_launcher.py") "safe"
+Write-CmdShim "cc-desktop"     (Join-Path $PyLibExec "cc_win_launcher.py") "desktop"
 Write-CmdShim "claude-sub2api" (Join-Path $PyLibExec "cc_win_launcher.py") "sub2api"
 Write-CmdShim "cc-totp"        (Join-Path $PyLibExec "cc_win_launcher.py") "totp"
 Write-CmdShim "cc-chrome"      (Join-Path $PyLibExec "cc_win_launcher.py") "chrome"
@@ -420,7 +483,7 @@ if (-not $NoTask) {
     }
 }
 
-Write-Host "✅ Windows ($env:COMPUTERNAME / $ArchTag) 一键部署完成: cc-switch, cc-safe, cc-chrome, cc-us-tunnel, cc-check-ip, cc-totp, cc-audit, claude-sub2api" -ForegroundColor Green
+Write-Host "✅ Windows ($env:COMPUTERNAME / $ArchTag) 一键部署完成: cc-switch, cc-safe, cc-desktop, cc-chrome, cc-us-tunnel, cc-check-ip, cc-totp, cc-audit, claude-sub2api" -ForegroundColor Green
 
 # ---------------------------------------------------------------------------
 # 6. 执行快捷后续动作 (-Add / -SetIp / -QuickStart)
@@ -448,7 +511,8 @@ if ($Add) {
     Write-Host "   1. 交互式菜单 (加号/换IP) : cc-switch init      (或直接双击 quickstart.cmd)"
     Write-Host "   2. 安全添加新账号         : cc-switch add - acc1"
     Write-Host "   3. 一键无损换 IP          : cc-switch set-ip acc1 -"
-    Write-Host "   4. 一键打开同源隔离浏览器 : cc-chrome acc1      (首次 /login 免配代理)"
-    Write-Host "   5. 启动隔离 Claude 会话   : cc-safe"
+    Write-Host "   4. 启动隔离 Claude 桌面端 : cc-desktop acc1     (Windows 原生 GUI 客户端防关联)"
+    Write-Host "   5. 打开同源隔离浏览器     : cc-chrome acc1      (首次登录授权免配代理)"
+    Write-Host "   6. 启动隔离 Claude CLI    : cc-safe"
     Write-Host "--------------------------------------------------------------------------"
 }

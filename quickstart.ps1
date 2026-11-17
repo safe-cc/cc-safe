@@ -37,6 +37,12 @@ switch ($FirstArg.ToLowerInvariant()) {
         & (Join-Path $BinDst "cc-chrome.cmd") @RestArgs
         exit $LASTEXITCODE
     }
+    "desktop" {
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $InstallPs1
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        & (Join-Path $BinDst "cc-desktop.cmd") @RestArgs
+        exit $LASTEXITCODE
+    }
     "audit" {
         & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $InstallPs1
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
