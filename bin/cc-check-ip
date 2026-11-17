@@ -1,54 +1,189 @@
 #!/usr/bin/env python3
 """
 cc-check-ip: Claude Code 代理出口 5 维深度风控体检脚本 (零进程参数泄密)
-- 通过 `curl -K -` 标准输入传递代理账密，杜绝 `ps aux` 暴露密码
+- 支持 `cc-check-ip -` (交互/标准输入) 与 `CC_CHECK_PROXY_URL` 环境变量，杜绝 `ps aux` 暴露密码
+- 通过 `curl --noproxy "" -K -` 标准输入传递代理账密，免疫 NO_PROXY=* 旁路与换行指令注入
 - 覆盖: Anthropic Edge 路由、Scamalytics、IPQS 欺诈分、ipapi 机房穿透、OAuth 接口状态码
 """
+import getpass
+import ipaddress
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
-from urllib.parse import urlsplit
+from urllib.parse import quote, unquote
 
+IS_WINDOWS = os.name == "nt"
 HOME = os.path.expanduser("~")
-os.environ["PATH"] = f"{HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin:" + os.environ.get("PATH", "")
+if IS_WINDOWS:
+    os.environ["PATH"] = os.path.join(HOME, ".local", "bin") + os.pathsep + os.environ.get("PATH", "")
+    _sys_curl = os.path.join(os.environ.get("SystemRoot") or r"C:\Windows", "System32", "curl.exe")
+    CURL_BIN = _sys_curl if os.path.isfile(_sys_curl) else (shutil.which("curl.exe") or "curl")
+else:
+    os.environ["PATH"] = f"{HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin:" + os.environ.get("PATH", "")
+    CURL_BIN = "curl"
 
 
-def _curl_esc(s: str) -> str:
-    return (s or "").replace("\\", "\\\\").replace('"', '\\"')
+def _curl_esc_strict(s: str, allow_newlines: bool = False) -> str:
+    val = s or ""
+    if "\x00" in val:
+        raise ValueError("NUL byte in curl argument")
+    if not allow_newlines and ("\r" in val or "\n" in val):
+        raise ValueError("CR/LF control character in curl header/url/proxy")
+    return (
+        val.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
+    )
 
 
-def safe_curl(url: str, proxy_url: str, timeout: int = 8, method: str = "GET", headers: dict = None, body: str = None, write_code_only: bool = False) -> str:
+def _encode_proxy_part(raw: str) -> str:
+    # 保留合法的 %XX 转义避免二次转义破坏 %41 等密码，同时对裸特殊字符 (#, @, :, [, ] 等) 安全编码
+    tokens = re.split(r"(%[0-9A-Fa-f]{2})", raw)
+    out = []
+    for tok in tokens:
+        if re.fullmatch(r"%[0-9A-Fa-f]{2}", tok):
+            out.append(tok)
+        else:
+            out.append(quote(tok, safe=""))
+    return "".join(out)
+
+
+def parse_any_proxy(proxy_raw: str) -> tuple:
+    s = (proxy_raw or "").strip()
+    if not s or any(c in s for c in "\r\n\x00"):
+        raise ValueError("代理地址为空或包含非法控制字符")
+
+    def _looks_like_hostport(cand: str) -> bool:
+        c = cand.strip()
+        if c.startswith("["):
+            rb_c = c.find("]")
+            return rb_c != -1 and rb_c + 2 < len(c) and c[rb_c + 1] == ":" and c[rb_c + 2 :].isdigit() and 1 <= int(c[rb_c + 2 :]) <= 65535
+        if c.count(":") == 1:
+            hc, pc = c.rsplit(":", 1)
+            return bool(hc) and not any(ch in hc for ch in " \t\r\n/@#[]") and pc.isdigit() and 1 <= int(pc) <= 65535
+        return False
+
+    if "://" in s:
+        scheme, rest = s.split("://", 1)
+        scheme = scheme.lower().strip()
+        if scheme not in ("http", "https", "socks5", "socks5h"):
+            raise ValueError(f"不支持的代理协议 '{scheme}' (仅支持 http/https/socks5/socks5h)")
+        rest = rest.split("/", 1)[0]
+        if "@" in rest:
+            userinfo, hostport = rest.rpartition("@")[0], rest.rpartition("@")[2]
+            puser, ppass = (userinfo.split(":", 1) if ":" in userinfo else (userinfo, ""))
+            auth_part = f"{_encode_proxy_part(puser)}:{_encode_proxy_part(ppass)}@"
+        else:
+            hostport = rest
+            auth_part = ""
+    elif s.startswith("["):
+        scheme = "http"
+        rb = s.find("]")
+        if rb == -1 or rb + 2 > len(s) or s[rb + 1] != ":":
+            raise ValueError("IPv6 代理格式错误，应为 [ipv6]:port:user:pass")
+        host_only = s[1:rb]
+        tail = s[rb + 2 :].split(":")
+        if len(tail) == 1:
+            hostport, auth_part = f"[{host_only}]:{tail[0]}", ""
+        elif len(tail) >= 3:
+            port_s, puser, ppass = tail[0], tail[1], ":".join(tail[2:])
+            hostport = f"[{host_only}]:{port_s}"
+            auth_part = f"{quote(puser, safe='')}:{quote(ppass, safe='')}@"
+        else:
+            raise ValueError("代理格式错误！应为 [ipv6]:port:user:pass")
+    elif (
+        "@" in s
+        and _looks_like_hostport(s.rpartition("@")[2])
+        and not (len(s.split(":")) >= 4 and "@" not in s.split(":")[0] and s.split(":")[1].isdigit() and s.rpartition("@")[0].count(":") >= 2)
+    ):
+        userinfo, hostport = s.rpartition("@")[0], s.rpartition("@")[2]
+        puser, ppass = (userinfo.split(":", 1) if ":" in userinfo else (userinfo, ""))
+        scheme = "http"
+        auth_part = f"{_encode_proxy_part(puser)}:{_encode_proxy_part(ppass)}@"
+    else:
+        scheme = "http"
+        parts = s.split(":")
+        if len(parts) == 2:
+            hostport, auth_part = f"{parts[0].strip()}:{parts[1].strip()}", ""
+        elif len(parts) >= 4:
+            host_s, port_s, puser, ppass = parts[0].strip(), parts[1].strip(), parts[2], ":".join(parts[3:])
+            hostport = f"{host_s}:{port_s}"
+            auth_part = f"{quote(puser, safe='')}:{quote(ppass, safe='')}@"
+        else:
+            raise ValueError("代理格式错误！应为 host:port:user:pass 或 http://user:pass@host:port")
+
+    hp = hostport.strip()
+    if hp.startswith("["):
+        rb = hp.find("]")
+        if rb == -1 or rb + 2 > len(hp) or hp[rb + 1] != ":":
+            raise ValueError("IPv6 代理地址缺少闭合 ] 或端口")
+        host = hp[1:rb]
+        port_s = hp[rb + 2 :]
+        ipaddress.ip_address(host)
+    else:
+        if hp.count(":") > 1:
+            # 用户可能传入了未加括号的 IPv6 host:port
+            h_cand, p_cand = hp.rsplit(":", 1)
+            ipaddress.ip_address(h_cand)
+            host, port_s = h_cand, p_cand
+        elif hp.count(":") == 1:
+            host, port_s = hp.rsplit(":", 1)
+        else:
+            raise ValueError("代理地址缺少端口号")
+
+    if not port_s.isdigit() or not (1 <= int(port_s) <= 65535):
+        raise ValueError(f"代理端口非法: '{port_s}'")
+    if not host or any(c in host for c in " \t\r\n/@#"):
+        raise ValueError("代理主机名包含非法字符")
+
+    disp_hp = f"[{host}]:{port_s}" if ":" in host else f"{host}:{port_s}"
+    return f"{scheme}://{auth_part}{disp_hp}", f"{scheme}://{disp_hp}"
+
+
+def safe_curl(
+    url: str,
+    proxy_url: str,
+    timeout: int = 8,
+    method: str = "GET",
+    headers: dict = None,
+    body: str = None,
+    write_code_only: bool = False,
+) -> str:
     lines = [
-        f'url = "{_curl_esc(url)}"',
-        f'proxy = "{_curl_esc(proxy_url)}"',
+        'noproxy = ""',
+        f'url = "{_curl_esc_strict(url)}"',
+        f'proxy = "{_curl_esc_strict(proxy_url)}"',
         "location",
     ]
     if method != "GET":
-        lines.append(f'request = "{_curl_esc(method)}"')
+        lines.append(f'request = "{_curl_esc_strict(method)}"')
     for k, v in (headers or {}).items():
-        lines.append(f'header = "{_curl_esc(f"{k}: {v}")}"')
+        lines.append(f'header = "{_curl_esc_strict(f"{k}: {v}")}"')
     if body is not None:
-        lines.append(f'data = "{_curl_esc(body)}"')
-    cmd = ["curl", "-s", "--max-time", str(timeout)]
+        lines.append(f'data = "{_curl_esc_strict(body, allow_newlines=True)}"')
+    cmd = [CURL_BIN, "-s", "--noproxy", "", "--max-time", str(timeout)]
     if write_code_only:
-        cmd += ["-o", "/dev/null", "-w", "%{http_code}"]
+        cmd += ["-o", os.devnull, "-w", "%{http_code}"]
     cmd += ["-K", "-"]
-    res = subprocess.run(cmd, input="\n".join(lines) + "\n", capture_output=True, text=True)
-    return res.stdout
-
-
-def redact_proxy(proxy_url: str) -> str:
     try:
-        u = urlsplit(proxy_url if "://" in proxy_url else f"http://{proxy_url}")
-        return f"{u.scheme}://{u.hostname or ''}{f':{u.port}' if u.port else ''}"
+        res = subprocess.run(cmd, input="\n".join(lines) + "\n", capture_output=True, text=True, timeout=timeout + 4)
+        return res.stdout
     except Exception:
-        return "<redacted>"
+        return ""
 
 
 def detect_claude_ver() -> str:
-    for cand in (os.path.join(HOME, ".local", "bin", "claude"), "claude"):
+    cands = (
+        (os.path.join(HOME, ".local", "bin", "claude.exe"), os.path.join(HOME, ".local", "bin", "claude.cmd"), "claude.exe", "claude")
+        if IS_WINDOWS
+        else (os.path.join(HOME, ".local", "bin", "claude"), "claude")
+    )
+    for cand in cands:
         try:
             r = subprocess.run([cand, "--version"], capture_output=True, text=True, timeout=3)
             m = re.search(r"(\d+\.\d+\.\d+)", r.stdout or "")
@@ -60,17 +195,39 @@ def detect_claude_ver() -> str:
 
 
 def main():
-    proxy_url = (sys.argv[1] if len(sys.argv) >= 2 else os.environ.get("CC_CHECK_PROXY_URL", "")).strip() or "http://127.0.0.1:7890"
-    if "://" not in proxy_url:
-        proxy_url = f"http://{proxy_url}"
+    if len(sys.argv) >= 2 and sys.argv[1] in ("-h", "--help"):
+        print("用法:")
+        print("  cc-check-ip -                              # 交互式隐藏输入代理 (推荐，零终端历史/ps留痕)")
+        print("  cc-check-ip 'host:port:user:pass'          # 直接检测指定代理")
+        print("  cc-check-ip 'http://user:pass@host:port'   # 检测标准 URL 代理")
+        print("  cc-check-ip                                # 默认检测当前本机 127.0.0.1:7890 隧道")
+        sys.exit(0)
+
+    raw_arg = ""
+    if len(sys.argv) >= 2:
+        if sys.argv[1] == "-":
+            if sys.stdin.isatty():
+                raw_arg = getpass.getpass("请输入待体检代理 (host:port:user:pass 或 http://user:pass@host:port): ").strip()
+            else:
+                raw_arg = sys.stdin.readline().strip()
+        else:
+            raw_arg = sys.argv[1].strip()
+    else:
+        raw_arg = os.environ.get("CC_CHECK_PROXY_URL", "").strip() or "http://127.0.0.1:7890"
+
+    try:
+        proxy_url, redacted_disp = parse_any_proxy(raw_arg)
+    except ValueError as e:
+        print(f"❌ 代理参数解析失败: {e}", file=sys.stderr)
+        sys.exit(1)
 
     print("==================================================================")
-    print(f"🛡️  [CC-Check-IP] 正在对代理出口 ({redact_proxy(proxy_url)}) 进行深度风控体检...")
+    print(f"🛡️  [CC-Check-IP] 正在对代理出口 ({redacted_disp}) 进行深度风控体检...")
     print("==================================================================")
 
     trace_raw = safe_curl("https://api.anthropic.com/cdn-cgi/trace", proxy_url, timeout=8)
     if not trace_raw.strip():
-        print("❌ [致命失败] 无法通过代理连接 https://api.anthropic.com/cdn-cgi/trace")
+        print("❌ [致命失败] 无法通过代理连接 https://api.anthropic.com/cdn-cgi/trace (请检查代理连通性或账密)")
         sys.exit(1)
 
     trace = {}
@@ -79,24 +236,33 @@ def main():
             k, v = line.split("=", 1)
             trace[k.strip()] = v.strip()
 
-    ip = trace.get("ip", "")
-    loc = trace.get("loc", "")
-    colo = trace.get("colo", "")
+    ip = trace.get("ip", "").strip()
+    loc = trace.get("loc", "").strip()
+    colo = trace.get("colo", "").strip()
 
+    try:
+        ip_obj = ipaddress.ip_address(ip)
+        ip = str(ip_obj)
+    except ValueError:
+        print(f"❌ [致命失败] 代理返回了非法出口 IP: '{ip}'")
+        sys.exit(1)
+
+    ip_url_seg = quote(ip, safe=":")
     print(f"1️⃣  [Anthropic 边缘路由] 出口 IP: {ip} | 地区: {loc} | 接入机房: {colo}")
-    if loc != "US" or not ip:
+    if loc != "US":
         print(f"   ❌ 未通过：地区非 US ({loc or '未知'})！")
     else:
         print("   ✅ 路由属地 US")
 
     print("2️⃣  [Scamalytics 欺诈分]")
-    scam_html = safe_curl(f"https://scamalytics.com/ip/{ip}", proxy_url, timeout=8) if ip else ""
+    scam_html = safe_curl(f"https://scamalytics.com/ip/{ip_url_seg}", proxy_url, timeout=8)
     m_scam = re.search(r"Fraud Score:\s*([0-9]+)", scam_html)
-    scam_score = m_scam.group(1) if m_scam else "N/A"
-    print(f"   Scamalytics Fraud Score: {scam_score} / 100")
+    scam_score = int(m_scam.group(1)) if m_scam else None
+    scam_score_str = str(scam_score) if scam_score is not None else "N/A"
+    print(f"   Scamalytics Fraud Score: {scam_score_str} / 100 (建议 < 35)")
 
     print("3️⃣  [IPQS (IPQualityScore) 严格反欺诈库]")
-    ipqs_raw = safe_curl(f"https://ipinfo.check.place/{ip}?db=ipqualityscore", proxy_url, timeout=10) if ip else ""
+    ipqs_raw = safe_curl(f"https://ipinfo.check.place/{ip_url_seg}?db=ipqualityscore", proxy_url, timeout=10)
     try:
         ipqs = json.loads(ipqs_raw) if ipqs_raw.strip() else {}
         if not isinstance(ipqs, dict):
@@ -105,13 +271,13 @@ def main():
         ipqs = {}
 
     ipqs_score = ipqs.get("fraud_score")
-    ipqs_score_str = str(ipqs_score) if ipqs_score is not None else "N/A"
+    ipqs_score_str = str(ipqs_score) if ipqs_score is not None else "N/A (第三方库暂不可达)"
     print(f"   IPQS Fraud Score : {ipqs_score_str} / 100 (要求 < 25)")
     print(f"   IPQS ISP / Org   : {ipqs.get('ISP', 'N/A')} / {ipqs.get('organization', 'N/A')}")
     print(f"   IPQS 风险标记    : proxy={ipqs.get('proxy', 'N/A')} | vpn={ipqs.get('vpn', 'N/A')} | recent_abuse={ipqs.get('recent_abuse', 'N/A')}")
 
     print("4️⃣  [ipapi 底层机房/租赁穿透检测]")
-    ipapi_raw = safe_curl(f"https://ipinfo.check.place/{ip}?db=ipapi", proxy_url, timeout=10) if ip else ""
+    ipapi_raw = safe_curl(f"https://ipinfo.check.place/{ip_url_seg}?db=ipapi", proxy_url, timeout=10)
     try:
         ipapi = json.loads(ipapi_raw) if ipapi_raw.strip() else {}
         if not isinstance(ipapi, dict):
@@ -142,20 +308,37 @@ def main():
         body='{"grant_type":"refresh_token","refresh_token":"probe","client_id":"9d1c250a-e61b-44d9-88ed-5944d1962f5e"}',
         write_code_only=True,
     ).strip() or "000"
-    print(f"   platform.claude.com/v1/oauth/token 状态码: {oauth_code_str} (预期 400 为正常未拦截，403/429/000 为风控或异常)")
+    print(f"   platform.claude.com/v1/oauth/token 状态码: {oauth_code_str} (预期 400/401 为正常可达，403/407/429/5xx/000 为风控或代理异常)")
 
     print("==================================================================")
-    ipqs_ok = isinstance(ipqs_score, (int, float)) and ipqs_score < 25
-    dc_ok = is_dc is False and is_abuser is False
-    oauth_ok = oauth_code_str not in ("000", "403", "429")
+    scam_ok = (scam_score is None) or (scam_score < 35)
+    # 若第三方镜像站 ipinfo.check.place 偶发限流不可达，回退结合 Scamalytics + ipinfo.io 机房关键词兜底判定
+    third_party_down = (ipqs_score is None) and (is_dc is None)
+    if third_party_down:
+        ipinfo_raw = safe_curl("https://ipinfo.io/json", proxy_url, timeout=6)
+        try:
+            org_str = (json.loads(ipinfo_raw).get("org") or "").lower()
+        except Exception:
+            org_str = ""
+        dc_keywords = ("amazon", "aws", "google", "microsoft", "azure", "digitalocean", "vultr", "linode", "choopa", "hetzner", "ovh", "datacamp", "m247", "cogent", "leaseweb", "alibaba", "tencent", "oracle")
+        fallback_dc = any(w in org_str for w in dc_keywords)
+        ipqs_ok = scam_score is not None and scam_score < 25
+        dc_ok = bool(org_str) and not fallback_dc
+        if ipqs_ok and dc_ok:
+            print("⚠️  [提示] 第三方聚合镜像暂不可达，已切换 Scamalytics + ASN 原生兜底核验。")
+    else:
+        ipqs_ok = isinstance(ipqs_score, (int, float)) and ipqs_score < 25
+        dc_ok = (is_dc is False) and (is_abuser is False)
 
-    if loc == "US" and ip and ipqs_ok and dc_ok and oauth_ok:
-        print(f"🟢 [综合结论] 该 IP ({ip}) 满足全部原生低风险 ISP 标准，可安全绑新号！")
+    oauth_ok = oauth_code_str in ("400", "401", "404", "405", "422")
+
+    if loc == "US" and ip and scam_ok and ipqs_ok and dc_ok and oauth_ok:
+        print(f"🟢 [综合结论] 该 IP ({ip}) 满足全部原生低风险 ISP 标准，可安全绑号/换 IP！")
         sys.exit(0)
     else:
         print(
-            f"🔴 [综合警告] 该 IP ({ip or '未知'}) 未通过准入标准 "
-            f"(LOC={loc}, IPQS={ipqs_score_str}, is_datacenter={is_dc}, oauth_http={oauth_code_str})！"
+            f"🔴 [综合警告] 该 IP ({ip or '未知'}) 未通过严格准入标准 "
+            f"(LOC={loc}, Scam={scam_score_str}, IPQS={ipqs_score_str}, is_datacenter={is_dc}, oauth_http={oauth_code_str})！"
         )
         sys.exit(2)
 

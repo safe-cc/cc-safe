@@ -1,33 +1,55 @@
 #!/usr/bin/env python3
 """
 cc-us-tunnel: Fail-Close Gost v3 Tunnel Manager for cc-safe
-- Zero credentials in /proc/<pid>/cmdline: renders chmod-600 gost.json and launches `gost -C gost.json`
-- Zero hardcoded fallback proxy: refuses to start if active proxy config is missing/invalid
+- Zero credentials in /proc/<pid>/cmdline: renders 0600-from-birth gost.json and launches `gost -C gost.json`
+- Blocks banned/inactive accounts even when invoked by cron (`*/5 * * * * cc-us-tunnel start`)
+- Zero local SSRF bypass: never dials server loopback/LAN targets on behalf of proxy clients
 - SHA-256 config state verification: auto-restarts Gost whenever upstream/listen config changes
 - flock mutex with non-blocking `start` (for cron) and blocking `ensure` (for cc-safe startup)
 """
-import fcntl
 import glob
 import hashlib
+import ipaddress
 import json
 import os
-import re
+import shlex
+import shutil
 import signal
 import socket
 import subprocess
 import sys
 import time
 from datetime import datetime, timezone
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote
+
+IS_WINDOWS = os.name == "nt"
+if IS_WINDOWS:
+    import ctypes
+    from ctypes import wintypes
+    import msvcrt
+else:
+    import fcntl
+
+try:
+    os.umask(0o077)
+except Exception:
+    pass
 
 HOME = os.path.expanduser("~")
-os.environ["PATH"] = f"{HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin:" + os.environ.get("PATH", "")
+if IS_WINDOWS:
+    os.environ["PATH"] = os.path.join(HOME, ".local", "bin") + os.pathsep + os.environ.get("PATH", "")
+    _sys_curl = os.path.join(os.environ.get("SystemRoot") or r"C:\Windows", "System32", "curl.exe")
+    CURL_BIN = _sys_curl if os.path.isfile(_sys_curl) else (shutil.which("curl.exe") or "curl")
+else:
+    os.environ["PATH"] = f"{HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin:" + os.environ.get("PATH", "")
+    CURL_BIN = "curl"
 
-SAFE_DIR = os.path.join(HOME, ".claude-safe")
+SAFE_DIR = os.path.abspath(os.environ.get("CC_SAFE_ROOT") or os.path.join(HOME, ".claude-safe"))
 CFG_DIR = os.path.join(SAFE_DIR, "config")
 LOG_DIR = os.path.join(SAFE_DIR, "logs")
 LOCK_DIR = os.path.join(SAFE_DIR, "locks")
 
+ACCOUNTS_FILE = os.path.join(CFG_DIR, "accounts.json")
 TUNNEL_JSON = os.path.join(CFG_DIR, "us-tunnel.json")
 LEGACY_ENV = os.path.join(CFG_DIR, "us-tunnel.env")
 GOST_CFG = os.path.join(CFG_DIR, "gost.json")
@@ -36,11 +58,25 @@ HASH_FILE = os.path.join(CFG_DIR, "us-tunnel.sha256")
 LOG_FILE = os.path.join(LOG_DIR, "us-tunnel.log")
 LOCK_FILE = os.path.join(LOCK_DIR, "tunnel.lock")
 
+
+def ensure_dir_700(path: str):
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+
+
 for _d in (SAFE_DIR, CFG_DIR, LOG_DIR, LOCK_DIR):
-    os.makedirs(_d, mode=0o700, exist_ok=True)
+    ensure_dir_700(_d)
 
 
 def find_gost_bin() -> str:
+    if IS_WINDOWS:
+        local_gost = os.path.join(HOME, ".local", "bin", "gost.exe")
+        if os.path.isfile(local_gost):
+            return local_gost
+        return shutil.which("gost.exe") or local_gost
     local_gost = os.path.join(HOME, ".local", "bin", "gost")
     if os.path.isfile(local_gost) and os.access(local_gost, os.X_OK):
         return local_gost
@@ -52,33 +88,140 @@ def find_gost_bin() -> str:
 
 
 def atomic_write(path: str, content: str, mode: int = 0o600):
-    tmp = f"{path}.tmp.{os.getpid()}"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(content)
-    os.chmod(tmp, mode)
-    os.replace(tmp, path)
+    ensure_dir_700(os.path.dirname(path))
+    tmp = f"{path}.tmp.{os.getpid()}.{time.time_ns()}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.chmod(tmp, mode)
+        except OSError:
+            pass
+        for attempt in range(4):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                if not IS_WINDOWS or attempt == 3:
+                    raise
+                time.sleep(0.05)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _split_host_port(hostport: str) -> tuple:
+    hp = hostport.strip()
+    if not hp:
+        raise ValueError("empty host:port")
+    if hp.startswith("["):
+        rb = hp.find("]")
+        if rb == -1 or rb + 2 > len(hp) or hp[rb + 1] != ":":
+            raise ValueError("invalid bracketed IPv6 host:port")
+        host = hp[1:rb]
+        port_s = hp[rb + 2 :]
+        ipaddress.ip_address(host)
+    else:
+        if hp.count(":") != 1:
+            raise ValueError("invalid host:port")
+        host, port_s = hp.rsplit(":", 1)
+    if not port_s.isdigit() or not (1 <= int(port_s) <= 65535):
+        raise ValueError(f"invalid port: {port_s}")
+    if not host or any(c in host for c in " \t\r\n/@#"):
+        raise ValueError("invalid proxy host")
+    return host, int(port_s)
+
+
+def _parse_upstream_url(raw_proxy: str) -> dict:
+    s = (raw_proxy or "").strip()
+    if not s or any(c in s for c in "\r\n\x00"):
+        return None
+    if "://" in s:
+        scheme, rest = s.split("://", 1)
+    else:
+        scheme, rest = "http", s
+    scheme = scheme.lower().strip()
+    if scheme not in ("http", "https", "socks5", "socks5h"):
+        return None
+    rest = rest.split("/", 1)[0]
+    if "@" in rest:
+        userinfo, hostport = rest.rpartition("@")[0], rest.rpartition("@")[2]
+        if ":" in userinfo:
+            raw_u, raw_p = userinfo.split(":", 1)
+        else:
+            raw_u, raw_p = userinfo, ""
+        username = unquote(raw_u)
+        password = unquote(raw_p)
+        has_auth = True
+    else:
+        hostport = rest
+        username, password, has_auth = "", "", False
+
+    try:
+        host, port = _split_host_port(hostport)
+    except ValueError:
+        return None
+
+    addr_fmt = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+    return {
+        "scheme": scheme,
+        "host": host,
+        "port": port,
+        "addr": addr_fmt,
+        "has_auth": has_auth,
+        "username": username,
+        "password": password,
+    }
 
 
 def redact_proxy(proxy_url: str) -> str:
     if not proxy_url:
         return "未配置"
-    try:
-        u = urlsplit(proxy_url if "://" in proxy_url else f"http://{proxy_url}")
-        host = u.hostname or ""
-        port = f":{u.port}" if u.port else ""
-        return f"{u.scheme}://{host}{port}"
-    except Exception:
-        return "<redacted>"
+    p = _parse_upstream_url(proxy_url)
+    if not p:
+        return "<invalid-or-redacted>"
+    return f"{p['scheme']}://{p['addr']}"
 
 
 def detect_tailscale_ip() -> str:
     try:
         res = subprocess.run(["tailscale", "ip", "-4"], capture_output=True, text=True, timeout=2)
         if res.returncode == 0 and res.stdout.strip():
-            return res.stdout.strip().splitlines()[0].strip()
+            cand = res.stdout.strip().splitlines()[0].strip()
+            ipaddress.ip_address(cand)
+            return cand
     except Exception:
         pass
     return ""
+
+
+def is_active_account_blocked_in_pool() -> tuple:
+    """检查 accounts.json 是否存在且当前激活账号已被封禁或清空，防止 cron 复活已封禁账号隧道。"""
+    if not os.path.exists(ACCOUNTS_FILE):
+        return False, ""
+    try:
+        with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        if not isinstance(d, dict):
+            return True, "accounts.json 格式非法"
+        ak = str(d.get("active") or "").strip()
+        accounts = d.get("accounts") or {}
+        if not isinstance(accounts, dict):
+            return True, "accounts 字段非法"
+        if not ak or ak not in accounts:
+            return True, "当前无激活账号"
+        acc = accounts.get(ak) or {}
+        if isinstance(acc, dict) and acc.get("status") == "banned":
+            return True, f"账号 [{ak}] 处于 banned 封禁熔断状态"
+    except Exception:
+        return True, "读取 accounts.json 异常"
+    return False, ""
 
 
 def load_tunnel_cfg() -> dict:
@@ -88,7 +231,7 @@ def load_tunnel_cfg() -> dict:
         "us_proxy": "",
         "http_listen": "127.0.0.1:7890",
         "socks_listen": "127.0.0.1:7891",
-        "expose_tailscale_proxy": True,
+        "expose_tailscale_proxy": False,
         "tailscale_http_listen": "",
     }
     if os.path.exists(TUNNEL_JSON):
@@ -107,7 +250,12 @@ def load_tunnel_cfg() -> dict:
                     if not line or line.startswith("#") or "=" not in line:
                         continue
                     k, v = line.split("=", 1)
-                    v = v.strip().strip('"').strip("'")
+                    k = k.strip()
+                    try:
+                        toks = shlex.split(v.strip())
+                        val = toks[0] if toks else ""
+                    except Exception:
+                        val = v.strip().strip('"').strip("'")
                     k_map = {
                         "ACTIVE_ACCOUNT": "active_account",
                         "EXPECTED_IP": "expected_ip",
@@ -116,47 +264,40 @@ def load_tunnel_cfg() -> dict:
                         "SOCKS_LISTEN": "socks_listen",
                         "TAILSCALE_HTTP_LISTEN": "tailscale_http_listen",
                     }
-                    if k.strip() in k_map:
-                        cfg[k_map[k.strip()]] = v
+                    if k in k_map:
+                        cfg[k_map[k]] = val
         except Exception:
             pass
 
-    if cfg.get("expose_tailscale_proxy", True) and not cfg.get("tailscale_http_listen"):
+    if bool(cfg.get("expose_tailscale_proxy", False)) and not cfg.get("tailscale_http_listen"):
         ts_ip = detect_tailscale_ip()
         if ts_ip:
             port = (cfg.get("http_listen") or "127.0.0.1:7890").rsplit(":", 1)[-1]
             cfg["tailscale_http_listen"] = f"{ts_ip}:{port}"
-    elif not cfg.get("expose_tailscale_proxy", True):
+    elif not bool(cfg.get("expose_tailscale_proxy", False)):
         cfg["tailscale_http_listen"] = ""
     return cfg
 
 
 def build_gost_config(cfg: dict) -> tuple:
-    raw_proxy = (cfg.get("us_proxy") or "").strip()
-    if not raw_proxy:
-        return None, ""
-    if "://" not in raw_proxy:
-        raw_proxy = f"http://{raw_proxy}"
-    parsed = urlsplit(raw_proxy)
-    scheme = (parsed.scheme or "http").lower()
-    host = parsed.hostname
-    port = parsed.port
-    if not host or not port:
+    parsed = _parse_upstream_url(cfg.get("us_proxy", ""))
+    if not parsed:
         return None, ""
 
+    scheme = parsed["scheme"]
     connector_type = "socks5" if scheme.startswith("socks5") else "http"
     dialer_type = "tls" if scheme == "https" else "tcp"
 
     node = {
         "name": "node-0",
-        "addr": f"{host}:{port}",
+        "addr": parsed["addr"],
         "connector": {"type": connector_type},
-        "dialer": {"type": dialer_type, "tls": {"serverName": host}},
+        "dialer": {"type": dialer_type, "tls": {"serverName": parsed["host"]}},
     }
-    if parsed.username is not None or parsed.password is not None:
+    if parsed["has_auth"]:
         node["connector"]["auth"] = {
-            "username": unquote(parsed.username or ""),
-            "password": unquote(parsed.password or ""),
+            "username": parsed["username"],
+            "password": parsed["password"],
         }
 
     services = [
@@ -185,6 +326,7 @@ def build_gost_config(cfg: dict) -> tuple:
         }
     )
 
+    # 注意: hop-0 绝不挂载本地直连 bypass，杜绝任何代理客户端借道 Gost 访问本机 127.0.0.1 内网服务 (SSRF)
     gost_obj = {
         "services": services,
         "chains": [
@@ -193,16 +335,9 @@ def build_gost_config(cfg: dict) -> tuple:
                 "hops": [
                     {
                         "name": "hop-0",
-                        "bypass": "bypass-local",
                         "nodes": [node],
                     }
                 ],
-            }
-        ],
-        "bypasses": [
-            {
-                "name": "bypass-local",
-                "matchers": ["100.64.0.0/10", "127.0.0.0/8", "::1/128", "localhost"],
             }
         ],
     }
@@ -213,34 +348,192 @@ def build_gost_config(cfg: dict) -> tuple:
 
 def is_port_listening(addr: str) -> bool:
     try:
-        host, port_s = addr.rsplit(":", 1)
-        with socket.create_connection((host, int(port_s)), timeout=0.4):
+        host, port = _split_host_port(addr)
+        with socket.create_connection((host, port), timeout=0.4):
             return True
     except Exception:
         return False
 
 
+def _get_k32():
+    k32 = ctypes.windll.kernel32
+    if not getattr(_get_k32, "_configured", False):
+        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+        k32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+        k32.GetProcessTimes.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+        ]
+        k32.GetProcessTimes.restype = wintypes.BOOL
+        k32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        k32.TerminateProcess.restype = wintypes.BOOL
+        k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        k32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+        k32.Process32FirstW.restype = wintypes.BOOL
+        k32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+        k32.Process32NextW.restype = wintypes.BOOL
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        k32.CloseHandle.restype = wintypes.BOOL
+        _get_k32._configured = True
+    return k32
+
+
+def _win_get_proc_create_time(pid: int) -> int:
+    if not IS_WINDOWS:
+        return 0
+    try:
+        k32 = _get_k32()
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not h:
+            return 0
+        try:
+            ct = wintypes.FILETIME()
+            et = wintypes.FILETIME()
+            kt = wintypes.FILETIME()
+            ut = wintypes.FILETIME()
+            if k32.GetProcessTimes(h, ctypes.byref(ct), ctypes.byref(et), ctypes.byref(kt), ctypes.byref(ut)):
+                return (int(ct.dwHighDateTime) << 32) | int(ct.dwLowDateTime)
+        finally:
+            k32.CloseHandle(h)
+    except Exception:
+        pass
+    return 0
+
+
+def _read_saved_pid_info() -> tuple:
+    if not os.path.exists(PID_FILE):
+        return 0, 0
+    try:
+        raw = open(PID_FILE, "r", encoding="utf-8").read().strip()
+        if ":" in raw:
+            p_s, ct_s = raw.split(":", 1)
+            return int(p_s), int(ct_s)
+        return int(raw), 0
+    except Exception:
+        return 0, 0
+
+
+def _win_query_exe_path(pid: int) -> str:
+    if not IS_WINDOWS:
+        return ""
+    try:
+        k32 = _get_k32()
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not h:
+            return ""
+        try:
+            buf = ctypes.create_unicode_buffer(1024)
+            sz = wintypes.DWORD(1024)
+            if k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(sz)):
+                return buf.value
+        finally:
+            k32.CloseHandle(h)
+    except Exception:
+        pass
+    return ""
+
+
+def _win_terminate_pid(pid: int):
+    if not IS_WINDOWS:
+        return
+    try:
+        k32 = _get_k32()
+        PROCESS_TERMINATE = 0x0001
+        h = k32.OpenProcess(PROCESS_TERMINATE, False, int(pid))
+        if h:
+            try:
+                k32.TerminateProcess(h, 1)
+            finally:
+                k32.CloseHandle(h)
+    except Exception:
+        pass
+
+
+def _is_our_gost_pid(pid: int, http_listen: str = "127.0.0.1:7890", expected_ct: int = 0) -> bool:
+    if IS_WINDOWS:
+        exe_p = _win_query_exe_path(pid)
+        if not exe_p or os.path.basename(exe_p).lower() != "gost.exe":
+            return False
+        if expected_ct > 0:
+            cur_ct = _win_get_proc_create_time(pid)
+            if cur_ct > 0 and cur_ct != expected_ct:
+                return False
+        expected_bin = find_gost_bin()
+        if expected_bin and os.path.isfile(expected_bin):
+            return os.path.normcase(os.path.abspath(exe_p)) == os.path.normcase(os.path.abspath(expected_bin))
+        return True
+    try:
+        if os.stat(f"/proc/{pid}").st_uid != os.getuid():
+            return False
+        raw = open(f"/proc/{pid}/cmdline", "rb").read()
+        argv = [x.decode("utf-8", "ignore") for x in raw.split(b"\x00") if x]
+        if not argv:
+            return False
+        exe_name = os.path.basename(argv[0])
+        cmd_join = " ".join(argv)
+        return exe_name == "gost" and (GOST_CFG in cmd_join or f"http://{http_listen}" in cmd_join)
+    except Exception:
+        return False
+
+
 def find_our_gost_pids(http_listen: str = "127.0.0.1:7890") -> list:
-    uid = os.getuid()
+    if IS_WINDOWS:
+        saved_pid, saved_ct = _read_saved_pid_info()
+        if saved_pid > 0:
+            return [saved_pid] if _is_our_gost_pid(saved_pid, http_listen, expected_ct=saved_ct) else []
+        default_safe = os.path.normcase(os.path.abspath(os.path.join(HOME, ".claude-safe")))
+        if os.environ.get("CC_AUDIT_SANDBOX") == "1" or os.path.normcase(SAFE_DIR) != default_safe:
+            return []
+        pids = []
+        try:
+            k32 = _get_k32()
+            TH32CS_SNAPPROCESS = 0x00000002
+            INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+            class PROCESSENTRY32W(ctypes.Structure):
+                _fields_ = [
+                    ("dwSize", wintypes.DWORD),
+                    ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD),
+                    ("th32DefaultHeapID", ctypes.c_size_t),
+                    ("th32ModuleID", wintypes.DWORD),
+                    ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD),
+                    ("pcPriClassBase", wintypes.LONG),
+                    ("dwFlags", wintypes.DWORD),
+                    ("szExeFile", wintypes.WCHAR * 260),
+                ]
+
+            snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+            if snap and snap != INVALID_HANDLE_VALUE:
+                try:
+                    pe = PROCESSENTRY32W()
+                    pe.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+                    if k32.Process32FirstW(snap, ctypes.byref(pe)):
+                        while True:
+                            if pe.szExeFile.lower() == "gost.exe" and _is_our_gost_pid(int(pe.th32ProcessID), http_listen):
+                                pids.append(int(pe.th32ProcessID))
+                            if not k32.Process32NextW(snap, ctypes.byref(pe)):
+                                break
+                finally:
+                    k32.CloseHandle(snap)
+        except Exception:
+            pass
+        return sorted(set(pids))
+
     pids = []
     for pdir in glob.glob("/proc/[0-9]*"):
         base = os.path.basename(pdir)
-        if not base.isdigit():
-            continue
-        pid = int(base)
-        try:
-            if os.stat(pdir).st_uid != uid:
-                continue
-            raw = open(f"{pdir}/cmdline", "rb").read()
-            argv = [x.decode("utf-8", "ignore") for x in raw.split(b"\x00") if x]
-            if not argv:
-                continue
-            exe_name = os.path.basename(argv[0])
-            cmd_join = " ".join(argv)
-            if exe_name == "gost" and (GOST_CFG in cmd_join or f"http://{http_listen}" in cmd_join):
-                pids.append(pid)
-        except Exception:
-            continue
+        if base.isdigit() and _is_our_gost_pid(int(base), http_listen):
+            pids.append(int(base))
     return sorted(pids)
 
 
@@ -249,16 +542,19 @@ def is_matching_running(cfg: dict, expected_digest: str) -> bool:
         return False
     if not is_port_listening(cfg["http_listen"]) or not is_port_listening(cfg["socks_listen"]):
         return False
+    if cfg.get("tailscale_http_listen") and not is_port_listening(cfg["tailscale_http_listen"]):
+        return False
     pids = find_our_gost_pids(cfg["http_listen"])
     if not pids:
         return False
-    for pid in pids:
-        try:
-            cmd = open(f"/proc/{pid}/cmdline", "rb").read().decode("utf-8", "ignore")
-            if GOST_CFG not in cmd:
+    if not IS_WINDOWS:
+        for pid in pids:
+            try:
+                cmd = open(f"/proc/{pid}/cmdline", "rb").read().decode("utf-8", "ignore")
+                if GOST_CFG not in cmd:
+                    return False
+            except Exception:
                 return False
-        except Exception:
-            return False
     try:
         running_hash = open(HASH_FILE, "r", encoding="utf-8").read().strip()
     except Exception:
@@ -267,21 +563,24 @@ def is_matching_running(cfg: dict, expected_digest: str) -> bool:
 
 
 def stop_tunnel_unlocked(http_listen: str = "127.0.0.1:7890", socks_listen: str = "127.0.0.1:7891"):
-    if os.path.exists(PID_FILE):
+    saved_pid, saved_ct = _read_saved_pid_info()
+    if saved_pid > 0:
         try:
-            saved = int(open(PID_FILE, "r", encoding="utf-8").read().strip())
-            os.kill(saved, signal.SIGTERM)
+            if _is_our_gost_pid(saved_pid, http_listen, expected_ct=saved_ct):
+                if IS_WINDOWS:
+                    _win_terminate_pid(saved_pid)
+                else:
+                    os.kill(saved_pid, signal.SIGTERM)
         except Exception:
-            pass
-        try:
-            os.remove(PID_FILE)
-        except OSError:
             pass
 
     pids = find_our_gost_pids(http_listen)
     for p in pids:
         try:
-            os.kill(p, signal.SIGTERM)
+            if IS_WINDOWS:
+                _win_terminate_pid(p)
+            else:
+                os.kill(p, signal.SIGTERM)
         except Exception:
             pass
 
@@ -297,19 +596,30 @@ def stop_tunnel_unlocked(http_listen: str = "127.0.0.1:7890", socks_listen: str 
             break
         for p in rem:
             try:
-                os.kill(p, signal.SIGKILL)
+                if IS_WINDOWS:
+                    _win_terminate_pid(p)
+                else:
+                    os.kill(p, signal.SIGKILL)
             except Exception:
                 pass
         time.sleep(0.1)
 
-    try:
-        os.remove(HASH_FILE)
-    except OSError:
-        pass
+    for f_rm in (PID_FILE, HASH_FILE, GOST_CFG):
+        try:
+            if os.path.exists(f_rm):
+                os.remove(f_rm)
+        except OSError:
+            pass
 
 
 def start_tunnel_unlocked() -> int:
     cfg = load_tunnel_cfg()
+    blocked, reason = is_active_account_blocked_in_pool()
+    if blocked:
+        stop_tunnel_unlocked(cfg["http_listen"], cfg["socks_listen"])
+        print(f"🛑 [Fail-Close] {reason}，已保持隧道关闭！", file=sys.stderr)
+        return 1
+
     rendered, digest = build_gost_config(cfg)
     if not rendered:
         stop_tunnel_unlocked(cfg["http_listen"], cfg["socks_listen"])
@@ -329,7 +639,26 @@ def start_tunnel_unlocked() -> int:
 
     now_iso = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
     redacted = redact_proxy(cfg.get("us_proxy", ""))
-    with open(LOG_FILE, "a", encoding="utf-8") as lf:
+    log_fd = os.open(LOG_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.chmod(LOG_FILE, 0o600)
+    except OSError:
+        pass
+    if IS_WINDOWS:
+        clean_gost_env = {
+            "USERPROFILE": HOME,
+            "SystemRoot": os.environ.get("SystemRoot") or r"C:\Windows",
+            "PATH": os.path.join(HOME, ".local", "bin"),
+        }
+        popen_extra = {"creationflags": subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS}
+    else:
+        clean_gost_env = {
+            "HOME": HOME,
+            "PATH": f"{HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin",
+        }
+        popen_extra = {"close_fds": True, "start_new_session": True}
+
+    with os.fdopen(log_fd, "a", encoding="utf-8") as lf:
         lf.write(
             f"[{now_iso}] Starting cc-us-tunnel account={cfg.get('active_account') or 'unknown'} "
             f"-> {redacted} (expected_ip={cfg.get('expected_ip') or 'none'})\n"
@@ -340,11 +669,12 @@ def start_tunnel_unlocked() -> int:
             stdin=subprocess.DEVNULL,
             stdout=lf,
             stderr=lf,
-            close_fds=True,
-            start_new_session=True,
+            env=clean_gost_env,
+            **popen_extra,
         )
 
-    atomic_write(PID_FILE, f"{proc.pid}\n", 0o600)
+    proc_ct = _win_get_proc_create_time(proc.pid) if IS_WINDOWS else 0
+    atomic_write(PID_FILE, f"{proc.pid}:{proc_ct}\n" if proc_ct else f"{proc.pid}\n", 0o600)
     atomic_write(HASH_FILE, f"{digest}\n", 0o600)
 
     for _ in range(16):
@@ -358,14 +688,29 @@ def start_tunnel_unlocked() -> int:
     return 1
 
 
+def _curl_esc_strict(s: str) -> str:
+    val = s or ""
+    if any(c in val for c in ("\r", "\n", "\x00")):
+        raise ValueError("illegal control character in curl argument")
+    return val.replace("\\", "\\\\").replace('"', '\\"')
+
+
 def probe_trace(proxy_url: str, timeout: int = 6) -> dict:
-    cfg_stdin = f'proxy = "{proxy_url}"\nurl = "https://api.anthropic.com/cdn-cgi/trace"\n'
-    res = subprocess.run(
-        ["curl", "-s", "--max-time", str(timeout), "-K", "-"],
-        input=cfg_stdin,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        cfg_stdin = (
+            'noproxy = ""\n'
+            f'proxy = "{_curl_esc_strict(proxy_url)}"\n'
+            'url = "https://api.anthropic.com/cdn-cgi/trace"\n'
+        )
+        res = subprocess.run(
+            [CURL_BIN, "-s", "--noproxy", "", "--max-time", str(timeout), "-K", "-"],
+            input=cfg_stdin,
+            capture_output=True,
+            text=True,
+            timeout=timeout + 3,
+        )
+    except Exception:
+        return {}
     out = {}
     for line in res.stdout.splitlines():
         if "=" in line:
@@ -376,92 +721,146 @@ def probe_trace(proxy_url: str, timeout: int = 6) -> dict:
 
 def status_tunnel() -> int:
     cfg = load_tunnel_cfg()
+    blocked, reason = is_active_account_blocked_in_pool()
     _, digest = build_gost_config(cfg)
-    if is_matching_running(cfg, digest):
+    if not blocked and is_matching_running(cfg, digest):
         pids = find_our_gost_pids(cfg["http_listen"])
         ts_note = f" (Tailscale: http://{cfg['tailscale_http_listen']})" if cfg.get("tailscale_http_listen") else ""
         print(f"✅ cc-us-tunnel ACTIVE (PID: {pids[0]} | 账号: {cfg.get('active_account') or '未知'})")
         print(f"   Local HTTP  : http://{cfg['http_listen']}{ts_note}")
-        print(f"   Local SOCKS5: socks5://{cfg['socks_listen']}")
+        print(f"   Local SOCKS5: socks5h://{cfg['socks_listen']}")
         print(f"   Upstream    : {redact_proxy(cfg.get('us_proxy', ''))} | Expected IP: {cfg.get('expected_ip') or '未设置'}")
-        tr = probe_trace(f"http://{cfg['http_listen']}", timeout=6)
-        if tr.get("ip"):
-            print(f"   Live Trace  : ip={tr.get('ip')} | loc={tr.get('loc')} | colo={tr.get('colo')}")
-            if cfg.get("expected_ip") and tr.get("ip") != cfg["expected_ip"]:
-                print(f"   ❌ [告警] 实际出口 IP ({tr.get('ip')}) 与绑定 IP ({cfg['expected_ip']}) 不一致！")
+        tr_h = probe_trace(f"http://{cfg['http_listen']}", timeout=6)
+        tr_s = probe_trace(f"socks5h://{cfg['socks_listen']}", timeout=6)
+        if tr_h.get("ip") and tr_s.get("ip"):
+            print(
+                f"   Live HTTP   : ip={tr_h.get('ip')} | loc={tr_h.get('loc')} | colo={tr_h.get('colo')}\n"
+                f"   Live SOCKS5h: ip={tr_s.get('ip')} | loc={tr_s.get('loc')}"
+            )
+            exp = (cfg.get("expected_ip") or "").strip()
+            if tr_h.get("loc") != "US" or tr_s.get("loc") != "US":
+                print("   ❌ [告警] 隧道出口地区非 US！")
+                return 2
+            if exp and (tr_h.get("ip") != exp or tr_s.get("ip") != exp):
+                print(f"   ❌ [告警] 实际出口 IP 与绑定 IP ({exp}) 不一致！")
                 return 2
             return 0
         print("   ⚠️ Warning: 上游代理连接超时或不可达！")
         return 2
-    print("❌ cc-us-tunnel STOPPED (或与当前配置不匹配)")
+    if blocked:
+        print(f"🛑 cc-us-tunnel LOCKED/STOPPED ({reason})")
+    else:
+        print("❌ cc-us-tunnel STOPPED (或与当前配置不匹配)")
     return 1
 
 
-def with_lock(blocking: bool, timeout_sec: float = 10.0):
-    fd = open(LOCK_FILE, "w", encoding="utf-8")
-    if not blocking:
+def _try_acquire_fd(fd) -> bool:
+    if IS_WINDOWS:
         try:
-            fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fd.seek(0)
+            if os.path.getsize(LOCK_FILE) == 0:
+                fd.write("0")
+                fd.flush()
+            fd.seek(0)
+            msvcrt.locking(fd.fileno(), msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError:
+            return False
+    try:
+        fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except BlockingIOError:
+        return False
+
+
+def _release_and_close_fd(fd):
+    if fd is None:
+        return
+    try:
+        if IS_WINDOWS:
+            fd.seek(0)
+            msvcrt.locking(fd.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        pass
+    try:
+        fd.close()
+    except Exception:
+        pass
+
+
+def with_lock(blocking: bool, timeout_sec: float = 10.0):
+    ensure_dir_700(LOCK_DIR)
+    raw_fd = os.open(LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        os.chmod(LOCK_FILE, 0o600)
+    except OSError:
+        pass
+    fd = os.fdopen(raw_fd, "r+", encoding="utf-8")
+    if not blocking:
+        if _try_acquire_fd(fd):
             return fd
-        except BlockingIOError:
-            fd.close()
-            return None
+        fd.close()
+        return None
     deadline = time.time() + timeout_sec
     while True:
-        try:
-            fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if _try_acquire_fd(fd):
             return fd
-        except BlockingIOError:
-            if time.time() >= deadline:
-                fd.close()
-                raise TimeoutError("等待 tunnel.lock 超时")
-            time.sleep(0.1)
+        if time.time() >= deadline:
+            fd.close()
+            raise TimeoutError("等待 tunnel.lock 超时")
+        time.sleep(0.1)
 
 
 def main():
     cmd = sys.argv[1] if len(sys.argv) >= 2 else "start"
-    if cmd == "start":
-        fd = with_lock(blocking=False)
-        if fd is None:
-            sys.exit(0)
-        try:
-            sys.exit(start_tunnel_unlocked())
-        finally:
-            fd.close()
-    elif cmd == "ensure":
-        fd = with_lock(blocking=True, timeout_sec=12.0)
-        try:
-            sys.exit(start_tunnel_unlocked())
-        finally:
-            fd.close()
-    elif cmd == "stop":
-        fd = with_lock(blocking=True, timeout_sec=10.0)
-        try:
-            cfg = load_tunnel_cfg()
-            stop_tunnel_unlocked(cfg["http_listen"], cfg["socks_listen"])
-        finally:
-            fd.close()
-        print("🛑 cc-us-tunnel stopped.")
-    elif cmd == "restart":
-        fd = with_lock(blocking=True, timeout_sec=12.0)
-        try:
-            cfg = load_tunnel_cfg()
-            stop_tunnel_unlocked(cfg["http_listen"], cfg["socks_listen"])
-            time.sleep(0.15)
-            sys.exit(start_tunnel_unlocked())
-        finally:
-            fd.close()
-    elif cmd == "status":
-        sys.exit(status_tunnel())
-    elif cmd in ("logs", "log"):
-        if os.path.exists(LOG_FILE):
-            with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
-                lines = f.readlines()[-50:]
-            sys.stdout.write("".join(lines))
+    try:
+        if cmd == "start":
+            fd = with_lock(blocking=False)
+            if fd is None:
+                sys.exit(0)
+            try:
+                sys.exit(start_tunnel_unlocked())
+            finally:
+                _release_and_close_fd(fd)
+        elif cmd == "ensure":
+            fd = with_lock(blocking=True, timeout_sec=12.0)
+            try:
+                sys.exit(start_tunnel_unlocked())
+            finally:
+                _release_and_close_fd(fd)
+        elif cmd == "stop":
+            fd = with_lock(blocking=True, timeout_sec=10.0)
+            try:
+                cfg = load_tunnel_cfg()
+                stop_tunnel_unlocked(cfg["http_listen"], cfg["socks_listen"])
+            finally:
+                _release_and_close_fd(fd)
+            print("🛑 cc-us-tunnel stopped.")
+        elif cmd == "restart":
+            fd = with_lock(blocking=True, timeout_sec=12.0)
+            try:
+                cfg = load_tunnel_cfg()
+                stop_tunnel_unlocked(cfg["http_listen"], cfg["socks_listen"])
+                time.sleep(0.15)
+                sys.exit(start_tunnel_unlocked())
+            finally:
+                _release_and_close_fd(fd)
+        elif cmd == "status":
+            sys.exit(status_tunnel())
+        elif cmd in ("logs", "log"):
+            if os.path.exists(LOG_FILE):
+                with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
+                    lines = f.readlines()[-50:]
+                sys.stdout.write("".join(lines))
+            else:
+                print("(暂无日志)")
         else:
-            print("(暂无日志)")
-    else:
-        print("Usage: cc-us-tunnel {start|ensure|stop|restart|status|logs}", file=sys.stderr)
+            print("Usage: cc-us-tunnel {start|ensure|stop|restart|status|logs}", file=sys.stderr)
+            sys.exit(1)
+    except TimeoutError as e:
+        print(f"❌ {e}", file=sys.stderr)
         sys.exit(1)
 
 

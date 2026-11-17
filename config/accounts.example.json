@@ -1,11 +1,12 @@
 {
   "active": "acc1",
-  "nodes": {
-    "host-a": "100.64.0.1",
-    "host-b": "100.64.0.2"
+  "peers": {
+    "host-a": "100.64.0.2",
+    "host-b": "100.64.0.1"
   },
-  "win_proxy": "100.64.0.1:7890",
-  "expose_tailscale_proxy": true,
+  "nodes": {},
+  "win_proxy": "127.0.0.1:7890",
+  "expose_tailscale_proxy": false,
   "accounts": {
     "acc1": {
       "id": "acc1",
@@ -18,7 +19,8 @@
       "proxy": "http://username:password@isp-proxy.example.com:10001",
       "ip": "198.51.100.10",
       "loc": "Boston, MA (AS6079 RCN)",
-      "tz": "America/New_York"
+      "tz": "America/New_York",
+      "ip_history": []
     }
   }
 }

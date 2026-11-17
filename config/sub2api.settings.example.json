@@ -4,9 +4,13 @@
     "ANTHROPIC_AUTH_TOKEN": "sk-REPLACE_WITH_YOUR_RELAY_KEY",
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
     "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
+    "DISABLE_TELEMETRY": "1",
+    "DISABLE_AUTOUPDATER": "1",
     "HTTP_PROXY": "",
     "HTTPS_PROXY": "",
     "ALL_PROXY": "",
-    "NO_PROXY": "*"
+    "http_proxy": "",
+    "https_proxy": "",
+    "all_proxy": ""
   }
 }

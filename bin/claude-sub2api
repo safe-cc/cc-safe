@@ -1,15 +1,29 @@
 #!/usr/bin/env bash
-# claude-sub2api: 纯 API 中转 (Relay) 隔离启动器 — 强制锁定 ~/.claude 并剥离一切个人代理/OAuth 环境
+# claude-sub2api: 纯 API 中转 (Relay) 隔离启动器 — 强制锁定 ~/.claude 并剥离一切个人代理/OAuth/Keyring 环境
 set -euo pipefail
 
-export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+# 剔除 cc-safe 专属 libexec 垫片路径，保持中转环境 100% 独立
+CLEAN_PATH=""
+IFS=':' read -ra _P_ARR <<< "$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:${PATH:-}"
+for _p in "${_P_ARR[@]}"; do
+    [ -z "$_p" ] && continue
+    case "${_p%/}" in
+        */.claude-safe/libexec) continue ;;
+    esac
+    CLEAN_PATH="${CLEAN_PATH:+$CLEAN_PATH:}$_p"
+done
+export PATH="$CLEAN_PATH"
+
 export CLAUDE_CONFIG_DIR="$HOME/.claude"
+export CLAUDE_SECURESTORAGE_CONFIG_DIR="$HOME/.claude"
+export ANTHROPIC_CONFIG_DIR="$HOME/.claude"
 export CLAUDE_SUB2API_MANAGED="1"
 
-unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL \
-      HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY \
-      http_proxy https_proxy all_proxy no_proxy \
-      LD_PRELOAD CC_SAFE_MANAGED CC_SAFE_ACCOUNT
+unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL ANTHROPIC_CUSTOM_HEADERS \
+      CLAUDE_CODE_OAUTH_TOKEN GIT_CONFIG_GLOBAL DBUS_SESSION_BUS_ADDRESS \
+      HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY GRPC_PROXY FTP_PROXY RSYNC_PROXY \
+      http_proxy https_proxy all_proxy no_proxy grpc_proxy ftp_proxy \
+      LD_PRELOAD CC_SAFE_MANAGED CC_SAFE_ACCOUNT CC_SAFE_ROOT
 
 SETTINGS_FILE="$HOME/.claude/sub2api.settings.json"
 if [ ! -f "$SETTINGS_FILE" ] || grep -q "sk-REPLACE_WITH_YOUR_RELAY_KEY" "$SETTINGS_FILE" 2>/dev/null; then

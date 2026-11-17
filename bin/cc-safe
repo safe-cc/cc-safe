@@ -2,55 +2,102 @@
 # cc-safe: Fail-Close Multi-Account Isolation Launcher for Claude Code
 # - Per-account physical CLAUDE_CONFIG_DIR (~/.claude-safe/profiles/<account>/home)
 # - Blocks banned accounts and unconfigured states
-# - Verifies BOTH HTTP (7890) and SOCKS5h (7891) egress match EXPECTED_IP & loc=US
-# - Enforces IPv4-first DNS, remote proxy_dns via proxychains4, and telemetry opt-out
+# - Verifies BOTH HTTP (7890) and SOCKS5h (7891) egress match EXPECTED_IP & loc=US (immune to NO_PROXY=*)
+# - Enforces IPv4-first DNS, remote proxy_dns via proxychains4, uppercase+lowercase proxy vars,
+#   Git author/committer/local-config isolation, and Linux PR_SET_CHILD_SUBREAPER orphan containment
 set -euo pipefail
 
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 
 SAFE_DIR="$HOME/.claude-safe"
 ACCOUNTS_FILE="$SAFE_DIR/config/accounts.json"
 
+resolve_helper() {
+    local name="$1"
+    if [ -x "$SELF_DIR/$name" ]; then
+        printf '%s\n' "$SELF_DIR/$name"
+    elif [ -x "$HOME/.local/bin/$name" ]; then
+        printf '%s\n' "$HOME/.local/bin/$name"
+    else
+        command -v "$name" 2>/dev/null || true
+    fi
+}
+
+CC_SWITCH_BIN="$(resolve_helper cc-switch)"
+CC_TUNNEL_BIN="$(resolve_helper cc-us-tunnel)"
+
 if [ ! -f "$ACCOUNTS_FILE" ]; then
     echo "❌ [CC-Guard] 未找到账号配置文件: $ACCOUNTS_FILE" >&2
-    echo "   请先运行: cc-switch add '邮箱----密码----TOTP密钥----sid----host:port:user:pass' [别名]" >&2
+    echo "   请先运行: cc-switch init  (或 cc-switch add -)" >&2
     exit 1
 fi
 
 read_active_meta() {
-    python3 -c '
-import json, os
-p = os.path.expanduser("~/.claude-safe/config/accounts.json")
-d = json.load(open(p, "r", encoding="utf-8"))
-ak = d.get("active", "")
-acc = (d.get("accounts") or {}).get(ak) or {}
-if not ak or not acc:
-    print(json.dumps({"ok": False}))
+    python3 - "$ACCOUNTS_FILE" <<'PY'
+import json, re, sys
+p = sys.argv[1]
+try:
+    with open(p, "r", encoding="utf-8") as f:
+        d = json.load(f)
+    if not isinstance(d, dict):
+        raise ValueError("root is not object")
+except Exception as e:
+    print(json.dumps({"ok": False, "err": f"配置文件损坏: {e}"}))
+    sys.exit(0)
+
+ak = str(d.get("active") or "").strip()
+accounts = d.get("accounts") or {}
+acc = accounts.get(ak) if isinstance(accounts, dict) else None
+if not ak or not isinstance(acc, dict):
+    print(json.dumps({"ok": False, "err": ""}))
 else:
+    email = str(acc.get("email") or "").strip()
+    git_user = re.sub(r"[^a-zA-Z0-9._-]", "", (email.split("@")[0] if "@" in email else ak)) or ak
+    git_email = re.sub(r"[\r\n\x00\"'\\]", "", email) if "@" in email else f"{ak}@users.noreply.github.com"
+    tz = str(acc.get("tz") or "").strip() or "America/New_York"
     print(json.dumps({
         "ok": True,
         "account": ak,
-        "status": acc.get("status", "active"),
-        "ip": acc.get("ip", ""),
-        "tz": acc.get("tz", "America/New_York"),
+        "status": str(acc.get("status") or "active").strip(),
+        "ip": str(acc.get("ip") or "").strip(),
+        "tz": tz,
+        "git_user": git_user,
+        "git_email": git_email,
     }))
-'
+PY
 }
 
-META_JSON=$(read_active_meta)
-ACTIVE_ACCOUNT=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(d.get("account",""))' "$META_JSON")
-ACC_STATUS=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(d.get("status",""))' "$META_JSON")
-EXPECTED_IP=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(d.get("ip",""))' "$META_JSON")
-TZ_VAL=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(d.get("tz","America/New_York"))' "$META_JSON")
+META_JSON="$(read_active_meta)"
+eval "$(python3 - "$META_JSON" <<'PY'
+import json, shlex, sys
+d = json.loads(sys.argv[1])
+for k, env_k in (
+    ("err", "META_ERR"),
+    ("account", "ACTIVE_ACCOUNT"),
+    ("status", "ACC_STATUS"),
+    ("ip", "EXPECTED_IP"),
+    ("tz", "TZ_VAL"),
+    ("git_user", "GIT_USER_VAL"),
+    ("git_email", "GIT_EMAIL_VAL"),
+):
+    print(f"{env_k}={shlex.quote(str(d.get(k) or ''))}")
+PY
+)"
+
+if [ -n "$META_ERR" ]; then
+    echo "❌ [CC-Guard 熔断] 无法解析 $ACCOUNTS_FILE ($META_ERR)" >&2
+    exit 1
+fi
 
 if [ -z "$ACTIVE_ACCOUNT" ]; then
-    echo "❌ [CC-Guard] 当前未激活任何账号！请运行 'cc-switch status' 或 'cc-switch add'。" >&2
+    echo "❌ [CC-Guard] 当前未激活任何账号！请运行 'cc-switch init' 或 'cc-switch status'。" >&2
     exit 1
 fi
 
 if [ "$ACC_STATUS" = "banned" ]; then
     echo "🚫 [CC-Guard 熔断] 当前账号 [$ACTIVE_ACCOUNT] 已标记为封禁 (banned)，严禁启动！" >&2
-    echo "👉 请运行 'cc-switch <可用账号>' 切换，或运行 'cc-switch add' 添加新账号。" >&2
+    echo "👉 请运行 'cc-switch <可用账号>' 切换，或运行 'cc-switch init' 添加新账号。" >&2
     exit 1
 fi
 
@@ -58,10 +105,6 @@ if [ -z "$EXPECTED_IP" ] || [ "$EXPECTED_IP" = "未知" ]; then
     echo "❌ [CC-Guard 熔断] 账号 [$ACTIVE_ACCOUNT] 未绑定明确的静态住宅 EXPECTED_IP，拒绝启动！" >&2
     exit 1
 fi
-
-# 提前打上受管进程锚点，确保启动窗口期间若发生并发切号能被 100% 识别终止
-export CC_SAFE_MANAGED="1"
-export CC_SAFE_ACCOUNT="$ACTIVE_ACCOUNT"
 
 PROXYCHAINS_BIN="${PROXYCHAINS_BIN:-$(command -v proxychains4 || true)}"
 PROXYCHAINS_CONF="$HOME/.local/etc/proxychains.conf"
@@ -76,20 +119,23 @@ if [ -z "$CLAUDE_BIN" ]; then
     exit 1
 fi
 
-# 2. 确保本地美国家宽隧道已按当前配置拉起 (ensure 模式等待锁完成，避免与 restart 竞态)
-if [ -x "$HOME/.local/bin/cc-us-tunnel" ]; then
-    "$HOME/.local/bin/cc-us-tunnel" ensure >/dev/null 2>&1 || true
+# 2. 确保本地美国家宽隧道已按当前配置拉起 (传入纯净环境，不向 gost 泄漏 CC_SAFE_MANAGED)
+if [ -n "$CC_TUNNEL_BIN" ] && [ -x "$CC_TUNNEL_BIN" ]; then
+    env -u CC_SAFE_MANAGED -u CC_SAFE_ACCOUNT -u NO_PROXY -u no_proxy "$CC_TUNNEL_BIN" ensure || {
+        echo "❌ [CC-Guard 熔断] 本地美国家宽隧道启动失败，请运行 'cc-us-tunnel status' 排查！" >&2
+        exit 1
+    }
 fi
 
-# 3. 双通道 (HTTP 7890 + SOCKS5h 7891) 出口 IP 与地区强制核验
+# 3. 双通道 (HTTP 7890 + SOCKS5h 7891) 出口 IP 与地区强制核验 (--noproxy "" 免疫 NO_PROXY=* 旁路)
 PROXY_HTTP="http://127.0.0.1:7890"
 PROXY_SOCKS="socks5h://127.0.0.1:7891"
 echo "🔍 [CC-Guard] 正在核验账号 [$ACTIVE_ACCOUNT] 专属隧道 (HTTP+SOCKS5h -> $EXPECTED_IP)..."
 
-TRACE_HTTP=$(curl -s -x "$PROXY_HTTP" --max-time 6 https://api.anthropic.com/cdn-cgi/trace || true)
-HTTP_LOC=$(echo "$TRACE_HTTP" | grep "^loc=" | cut -d= -f2 || true)
-HTTP_IP=$(echo "$TRACE_HTTP" | grep "^ip=" | cut -d= -f2 || true)
-COLO=$(echo "$TRACE_HTTP" | grep "^colo=" | cut -d= -f2 || true)
+TRACE_HTTP="$(curl -s --noproxy "" -x "$PROXY_HTTP" --max-time 6 https://api.anthropic.com/cdn-cgi/trace | tr -d '\r' || true)"
+HTTP_LOC="$(printf '%s\n' "$TRACE_HTTP" | grep "^loc=" | cut -d= -f2 || true)"
+HTTP_IP="$(printf '%s\n' "$TRACE_HTTP" | grep "^ip=" | cut -d= -f2 || true)"
+COLO="$(printf '%s\n' "$TRACE_HTTP" | grep "^colo=" | cut -d= -f2 || true)"
 
 if [ "$HTTP_LOC" != "US" ] || [ -z "$HTTP_IP" ]; then
     echo "❌ [严重警告] HTTP 代理链路异常或非美国出口 (LOC=${HTTP_LOC:-超时}, IP=${HTTP_IP:-无})！" >&2
@@ -103,10 +149,11 @@ if [ "$HTTP_IP" != "$EXPECTED_IP" ]; then
     exit 1
 fi
 
-TRACE_SOCKS=$(curl -s -x "$PROXY_SOCKS" --max-time 6 https://api.anthropic.com/cdn-cgi/trace || true)
-SOCKS_IP=$(echo "$TRACE_SOCKS" | grep "^ip=" | cut -d= -f2 || true)
-if [ "$SOCKS_IP" != "$EXPECTED_IP" ]; then
-    echo "❌ [严重警告] SOCKS5h 隧道出口 ($SOCKS_IP) 与绑定 IP ($EXPECTED_IP) 不一致或不可达！" >&2
+TRACE_SOCKS="$(curl -s --noproxy "" -x "$PROXY_SOCKS" --max-time 6 https://api.anthropic.com/cdn-cgi/trace | tr -d '\r' || true)"
+SOCKS_LOC="$(printf '%s\n' "$TRACE_SOCKS" | grep "^loc=" | cut -d= -f2 || true)"
+SOCKS_IP="$(printf '%s\n' "$TRACE_SOCKS" | grep "^ip=" | cut -d= -f2 || true)"
+if [ "$SOCKS_LOC" != "US" ] || [ "$SOCKS_IP" != "$EXPECTED_IP" ]; then
+    echo "❌ [严重警告] SOCKS5h 隧道出口异常 (LOC=${SOCKS_LOC:-超时}, IP=${SOCKS_IP:-无}, 绑定=$EXPECTED_IP)！" >&2
     echo "🛑 proxychains4 依赖 127.0.0.1:7891，已熔断阻断启动！" >&2
     exit 1
 fi
@@ -116,65 +163,217 @@ PROFILE_HOME="$SAFE_DIR/profiles/$ACTIVE_ACCOUNT/home"
 export CLAUDE_CONFIG_DIR="$PROFILE_HOME"
 CRED_PATH="$PROFILE_HOME/.credentials.json"
 
-if [ -x "$HOME/.local/bin/cc-switch" ]; then
-    "$HOME/.local/bin/cc-switch" apply-local "$ACTIVE_ACCOUNT" >/dev/null 2>&1 || true
-    "$HOME/.local/bin/cc-switch" auto-sync >/dev/null 2>&1 || true
+if [ -n "$CC_SWITCH_BIN" ] && [ -x "$CC_SWITCH_BIN" ]; then
+    env -u CC_SAFE_MANAGED -u CC_SAFE_ACCOUNT "$CC_SWITCH_BIN" apply-local "$ACTIVE_ACCOUNT" --if-idle >/dev/null 2>&1 || true
+    ( env -u CC_SAFE_MANAGED -u CC_SAFE_ACCOUNT "$CC_SWITCH_BIN" auto-sync </dev/null >/dev/null 2>&1 & ) || true
 fi
 
 # 二次复核 active 账号未在启动期间被并发切换或封禁
-RECHECK_META=$(read_active_meta)
-RECHECK_ACC=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(d.get("account",""))' "$RECHECK_META")
-RECHECK_ST=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(d.get("status",""))' "$RECHECK_META")
-if [ "$RECHECK_ACC" != "$ACTIVE_ACCOUNT" ] || [ "$RECHECK_ST" = "banned" ]; then
-    echo "🛑 [CC-Guard 熔断] 启动期间检测到账号状态变更 ($ACTIVE_ACCOUNT -> $RECHECK_ACC / $RECHECK_ST)，已中止启动！" >&2
+RECHECK_META="$(read_active_meta)"
+RECHECK_ACC="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("account",""))' "$RECHECK_META")"
+RECHECK_ST="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("status",""))' "$RECHECK_META")"
+RECHECK_IP="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("ip",""))' "$RECHECK_META")"
+if [ "$RECHECK_ACC" != "$ACTIVE_ACCOUNT" ] || [ "$RECHECK_ST" = "banned" ] || [ "$RECHECK_IP" != "$EXPECTED_IP" ]; then
+    echo "🛑 [CC-Guard 熔断] 启动期间检测到账号/IP状态变更 ($ACTIVE_ACCOUNT -> $RECHECK_ACC / $RECHECK_ST)，已中止启动！" >&2
     exit 1
 fi
 
-rm -rf "$PROFILE_HOME/telemetry" "$PROFILE_HOME/statsig" "$PROFILE_HOME/cache" 2>/dev/null || true
-
 echo "✅ [核验通过] 账号: $ACTIVE_ACCOUNT | 专属目录: ~/.claude-safe/profiles/$ACTIVE_ACCOUNT/home"
-echo "   出口 IP: $HTTP_IP (HTTP & SOCKS5h 双通道一致) | 机房: $COLO | 时区: $TZ_VAL"
+echo "   出口 IP: $HTTP_IP (HTTP & SOCKS5h 双通道 US 一致) | 机房: $COLO | 时区: $TZ_VAL"
 
-# 5. 注入纯净环境变量与进程归属标记 (彻底剥离中转变量、系统 Keyring、IPv6 与遥测)
-unset ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY BROWSER \
-      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC CLAUDE_SUB2API_MANAGED \
-      CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_ENABLE_TELEMETRY OTEL_EXPORTER_OTLP_ENDPOINT \
-      DBUS_SESSION_BUS_ADDRESS
+# 5. 注入纯净环境变量与受管进程树锚点 (剥离中转变量、自定义头、系统 Keyring、宿主机 Git/GH 令牌与大小写代理干扰)
+export CC_SAFE_MANAGED="1"
+export CC_SAFE_ACCOUNT="$ACTIVE_ACCOUNT"
+export CC_SAFE_ROOT="$SAFE_DIR"
+
+unset ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_CUSTOM_HEADERS \
+      BROWSER CLAUDE_SUB2API_MANAGED CLAUDE_CODE_OAUTH_TOKEN \
+      CLAUDE_CODE_ENABLE_TELEMETRY OTEL_EXPORTER_OTLP_ENDPOINT OTEL_EXPORTER_OTLP_HEADERS \
+      CLAUDE_CODE_ORGANIZATION_UUID CLAUDE_CODE_ACCOUNT_UUID CLAUDE_CODE_HARBOR_KITE_CLOUD \
+      DBUS_SESSION_BUS_ADDRESS FTP_PROXY ftp_proxy RSYNC_PROXY \
+      GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS GIT_CONFIG_SYSTEM
+
+if [ "${CC_SAFE_KEEP_HOST_TOKENS:-0}" != "1" ]; then
+    unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITLAB_TOKEN GLAB_TOKEN \
+          SSH_CONNECTION SSH_CLIENT SSH_TTY TMUX TMUX_PANE
+    mkdir -p -m 700 "$PROFILE_HOME/.config/gh"
+    export GH_CONFIG_DIR="$PROFILE_HOME/.config/gh"
+fi
+
 export CLAUDE_SECURESTORAGE_CONFIG_DIR="$PROFILE_HOME"
 export ANTHROPIC_CONFIG_DIR="$PROFILE_HOME"
+export GIT_CONFIG_NOSYSTEM="1"
+export GIT_SSH_COMMAND="${CC_SAFE_GIT_SSH_COMMAND:-ssh -o ControlMaster=no -o ControlPath=none}"
+
 if [ -f "$SAFE_DIR/profiles/$ACTIVE_ACCOUNT/gitconfig" ]; then
     export GIT_CONFIG_GLOBAL="$SAFE_DIR/profiles/$ACTIVE_ACCOUNT/gitconfig"
+    export GIT_AUTHOR_NAME="$GIT_USER_VAL"
+    export GIT_AUTHOR_EMAIL="$GIT_EMAIL_VAL"
+    export GIT_COMMITTER_NAME="$GIT_USER_VAL"
+    export GIT_COMMITTER_EMAIL="$GIT_EMAIL_VAL"
+    export EMAIL="$GIT_EMAIL_VAL"
     if [ -x "$SAFE_DIR/libexec/git" ]; then
         export PATH="$SAFE_DIR/libexec:$PATH"
     fi
+else
+    unset GIT_CONFIG_GLOBAL GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL EMAIL
 fi
+
 export TZ="$TZ_VAL"
 export HTTPS_PROXY="http://127.0.0.1:7890"
+export https_proxy="http://127.0.0.1:7890"
 export HTTP_PROXY="http://127.0.0.1:7890"
-export ALL_PROXY="socks5://127.0.0.1:7891"
-export NO_PROXY="localhost,127.0.0.1,100.64.0.0/10"
+export http_proxy="http://127.0.0.1:7890"
+export ALL_PROXY="socks5h://127.0.0.1:7891"
+export all_proxy="socks5h://127.0.0.1:7891"
+export GRPC_PROXY="http://127.0.0.1:7890"
+export grpc_proxy="http://127.0.0.1:7890"
+export NO_PROXY="localhost,127.0.0.1,::1"
+export no_proxy="localhost,127.0.0.1,::1"
 export NODE_OPTIONS="--dns-result-order=ipv4first"
 export BUN_FEATURE_FLAG_DISABLE_IPV6="1"
 export DISABLE_TELEMETRY="1"
 export DO_NOT_TRACK="1"
 export DISABLE_ERROR_REPORTING="1"
-export CLAUDE_CODE_DISABLE_1P_EVENT_LOGGING="1"
+export DISABLE_AUTOUPDATER="1"
+export DISABLE_GROWTHBOOK="1"
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"
 export CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL="1"
 
-# 6. 首次登录自动归档监听：仅同步凭证与 identity (sync-cred)，不在会话运行中覆写 .claude.json
-MAIN_PID=$$
-if [ ! -s "$CRED_PATH" ] && [ -x "$HOME/.local/bin/cc-switch" ] && [ "${1:-}" != "--version" ] && [ "${1:-}" != "-v" ] && [ "${1:-}" != "--help" ] && [ "${1:-}" != "-h" ]; then
-    (
-        for _ in $(seq 1 360); do
-            kill -0 "$MAIN_PID" 2>/dev/null || exit 0
-            if [ -s "$CRED_PATH" ]; then
-                sleep 2
-                "$HOME/.local/bin/cc-switch" sync-cred --quiet >/dev/null 2>&1 || true
-                exit 0
-            fi
-            sleep 1
-        done
-    ) </dev/null >/dev/null 2>&1 &
-fi
+# 6. 通过 Linux PR_SET_CHILD_SUBREAPER 容器守护启动 proxychains4 + claude:
+#    - 即使工具子进程使用 setsid/nohup + env -i 清空环境变量并脱离父进程，也会被内核收养至本 subreaper 而非 PID 1！
+#    - 会话退出或切号清理时自动收割全部收养子孙进程，100% 杜绝孤儿进程越狱串 IP。
+#    - 同时内置无超时首次登录凭证监听，归档时严格锁定 ACTIVE_ACCOUNT 防止切号串写。
+exec python3 - "$CRED_PATH" "${CC_SWITCH_BIN:-}" "$ACTIVE_ACCOUNT" "$PROXYCHAINS_BIN" -q -f "$PROXYCHAINS_CONF" "$CLAUDE_BIN" "$@" <<'PY'
+import ctypes, glob, os, signal, subprocess, sys, threading, time
 
-exec "$PROXYCHAINS_BIN" -q -f "$PROXYCHAINS_CONF" "$CLAUDE_BIN" "$@"
+cred_path = sys.argv[1]
+sw_bin = sys.argv[2]
+acc_name = sys.argv[3]
+child_cmd = sys.argv[4:]
+
+try:
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    libc.prctl(36, 1, 0, 0, 0)  # PR_SET_CHILD_SUBREAPER = 36
+except Exception:
+    pass
+
+need_watch = (
+    (not os.path.exists(cred_path) or os.path.getsize(cred_path) <= 20)
+    and bool(sw_bin)
+    and os.path.isfile(sw_bin)
+    and (len(child_cmd) < 5 or child_cmd[4] not in ("--version", "-v", "--help", "-h"))
+)
+stop_evt = threading.Event()
+synced_once = threading.Event()
+
+def _run_sync_cred():
+    if synced_once.is_set():
+        return
+    synced_once.set()
+    env_clean = {k: v for k, v in os.environ.items() if k not in ("CC_SAFE_MANAGED", "CC_SAFE_ACCOUNT")}
+    subprocess.run([sw_bin, "sync-cred", acc_name, "--quiet"], env=env_clean, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+
+def _cred_watcher():
+    while not stop_evt.wait(1.0):
+        try:
+            if os.path.exists(cred_path) and os.path.getsize(cred_path) > 20:
+                time.sleep(1.2)
+                _run_sync_cred()
+                return
+        except Exception:
+            pass
+
+watcher_thread = None
+if need_watch:
+    watcher_thread = threading.Thread(target=_cred_watcher, daemon=True)
+    watcher_thread.start()
+
+proc = subprocess.Popen(child_cmd)
+signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+def _reap_adopted_descendants(sig_num, include_main=False):
+    my_pid = os.getpid()
+    uid = os.getuid()
+    children = {}
+    for pdir in glob.glob("/proc/[0-9]*"):
+        b = os.path.basename(pdir)
+        if not b.isdigit():
+            continue
+        pid = int(b)
+        try:
+            if os.stat(pdir).st_uid != uid:
+                continue
+            st = open(f"{pdir}/stat", "rb").read().decode("utf-8", "ignore")
+            rp = st.rfind(")")
+            if rp == -1:
+                continue
+            ppid = int(st[rp + 2:].split()[1])
+            children.setdefault(ppid, []).append(pid)
+        except Exception:
+            pass
+
+    visited = set()
+    ordered = []
+
+    def _dfs(curr):
+        if curr in visited:
+            return
+        visited.add(curr)
+        for ch in children.get(curr, []):
+            if not include_main and ch == proc.pid:
+                continue
+            _dfs(ch)
+        if curr != my_pid:
+            ordered.append(curr)
+
+    _dfs(my_pid)
+    for pid in ordered:
+        try:
+            os.kill(pid, sig_num)
+        except Exception:
+            pass
+
+def _forward_term(signum, _frame):
+    try:
+        proc.send_signal(signum)
+    except Exception:
+        pass
+    _reap_adopted_descendants(signal.SIGTERM, include_main=False)
+
+signal.signal(signal.SIGTERM, _forward_term)
+signal.signal(signal.SIGHUP, _forward_term)
+
+rc = proc.wait()
+stop_evt.set()
+if watcher_thread is not None:
+    watcher_thread.join(timeout=3.0)
+if need_watch and not synced_once.is_set() and os.path.exists(cred_path) and os.path.getsize(cred_path) > 20:
+    try:
+        _run_sync_cred()
+    except Exception:
+        pass
+
+# 会话主进程退出后，递归清理由本 subreaper 收养的全部残留后台孤儿子孙树并回收僵尸
+_reap_adopted_descendants(signal.SIGTERM, include_main=True)
+deadline = time.time() + 0.5
+while time.time() < deadline:
+    try:
+        wpid, _ = os.waitpid(-1, os.WNOHANG)
+        if wpid == 0:
+            time.sleep(0.05)
+    except ChildProcessError:
+        break
+    except Exception:
+        break
+_reap_adopted_descendants(signal.SIGKILL, include_main=True)
+while True:
+    try:
+        wpid, _ = os.waitpid(-1, os.WNOHANG)
+        if wpid == 0:
+            break
+    except Exception:
+        break
+
+sys.exit(rc)
+PY
