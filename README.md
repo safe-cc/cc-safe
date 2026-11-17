@@ -1,6 +1,8 @@
 # `cc-safe` 
 
+
 Claude Code 多账号物理硬隔离与美国静态住宅 ISP 专线防封套件
+
 
 `cc-safe` 是一套专为在 Linux 服务器（单机或双机集群）上安全使用多个 Claude Pro / Max 个人订阅账号而设计的**账号级物理硬隔离 + Fail-Close 静态住宅 ISP 专线熔断**一键工具链，同时实现与 API 中转通道（`claude-sub2api`）的 100% 物理分离。
 
