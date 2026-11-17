@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-cc-audit: cc-safe 360° 无死角防泄漏、防关联与对抗级实测审计套件 (15 维全栈真实验证)
+cc-audit: cc-safe 360° 无死角防泄漏、防关联与对抗级实测审计套件 (16 维全栈真实验证)
 用法:
-  cc-audit                   # 执行完整 15 维静态扫描 + 真实 Claude 抓包 + Syscall + 熔断 + 换IP + 防逃逸压测
+  cc-audit                   # 执行完整 16 维静态扫描 + 真实 Claude 抓包 + Syscall + 熔断 + 换IP + Desktop 防关联压测
   cc-audit --repo-only [dir] # 仅扫描 Git 仓库工作区与完整提交历史是否存在本机隐私/密钥泄漏 (供 pre-push 钩子调用)
 """
 import getpass
@@ -140,6 +140,39 @@ def collect_host_sensitive_markers() -> list:
                     if tok.startswith(("127.", "172.17.", "fe80:", "::1")):
                         continue
                     _add(tok, lbl, 5)
+        except Exception:
+            pass
+
+    try:
+        r_ts = subprocess.run(["tailscale", "status", "--json"], capture_output=True, text=True, timeout=2)
+        if r_ts.returncode == 0 and r_ts.stdout.strip():
+            ts_data = json.loads(r_ts.stdout)
+            nodes = [ts_data.get("Self") or {}] + list((ts_data.get("Peer") or {}).values())
+            for nd in nodes:
+                if not isinstance(nd, dict):
+                    continue
+                _add(str(nd.get("HostName") or ""), "host:tailscale_peer_hostname", 4)
+                dns_n = str(nd.get("DNSName") or "").strip(".")
+                if dns_n:
+                    _add(dns_n, "host:tailscale_dns", 6)
+                    for part in dns_n.split("."):
+                        if part not in ("ts", "net"):
+                            _add(part, "host:tailscale_domain_part", 5)
+                for tip in nd.get("TailscaleIPs") or []:
+                    if isinstance(tip, str) and not tip.startswith("fd7a:"):
+                        _add(tip, "host:tailscale_peer_ip", 7)
+    except Exception:
+        pass
+
+    for pub_p in glob.glob(os.path.join(REAL_HOME, ".ssh", "*.pub")):
+        try:
+            parts = open(pub_p, "r", encoding="utf-8", errors="ignore").read().strip().split()
+            if len(parts) >= 3:
+                comment = " ".join(parts[2:]).strip()
+                _add(comment, "host:ssh_pub_comment", 5)
+                for sub_tok in re.split(r"[@._\s+-]+", comment):
+                    if sub_tok not in ("gmail", "com", "outlook", "hotmail", "qq", "icloud"):
+                        _add(sub_tok, "host:ssh_pub_token", 5)
         except Exception:
             pass
 
@@ -348,9 +381,9 @@ def _can_use_strace() -> bool:
 
 
 def run_full_audit(repo_dir: str) -> int:
-    total_checks = 15
+    total_checks = 16
     print("==============================================================================================")
-    print("🛡️  cc-safe 360° 无死角防封与防关联对抗审计 (15 维: 隐私扫描 + 真实抓包 + Syscall + 熔断 + 换IP)")
+    print("🛡️  cc-safe 360° 无死角防封与防关联对抗审计 (16 维: 隐私扫描 + 真实抓包 + Syscall + 熔断 + 换IP + Desktop)")
     print("==============================================================================================")
 
     results = []
@@ -362,7 +395,7 @@ def run_full_audit(repo_dir: str) -> int:
         results.append((idx, title, ok, detail))
 
     # ------------------------------------------------------------------
-    # [01/15] 仓库工作区与 Git 历史隐私扫描
+    # [01/16] 仓库工作区与 Git 历史隐私扫描
     # ------------------------------------------------------------------
     if repo_dir:
         ok1, msg1 = audit_repo_privacy(repo_dir)
@@ -371,11 +404,35 @@ def run_full_audit(repo_dir: str) -> int:
     record(1, "仓库源码、未跟踪文件与全量 Git 历史隐私零泄漏扫描", ok1, msg1)
 
     if IS_WINDOWS:
-        claude_bin = (
-            shutil.which("claude.exe")
-            or shutil.which("claude.cmd")
-            or os.path.join(REAL_HOME, ".local", "bin", "claude.exe")
-        )
+        claude_bin = ""
+        for _cand_c in (
+            os.path.join(REAL_HOME, ".local", "bin", "claude.exe"),
+            shutil.which("claude.exe") or "",
+            shutil.which("claude.cmd") or "",
+        ):
+            if _cand_c and os.path.isfile(_cand_c):
+                _low_c = _cand_c.lower().replace("/", "\\")
+                if "\\windowsapps\\" not in _low_c and "\\anthropicclaude\\" not in _low_c:
+                    claude_bin = _cand_c
+                    break
+        if not claude_bin or not os.path.isfile(claude_bin):
+            _wl_cand = (
+                os.path.join(repo_dir, "windows", "cc_win_launcher.py")
+                if repo_dir and os.path.isfile(os.path.join(repo_dir, "windows", "cc_win_launcher.py"))
+                else os.path.join(REAL_HOME, ".claude-safe", "libexec", "py", "cc_win_launcher.py")
+            )
+            if os.path.isfile(_wl_cand):
+                try:
+                    import importlib.util as _ilu
+                    _sp = _ilu.spec_from_file_location("cc_win_l_aud", _wl_cand)
+                    _wm = _ilu.module_from_spec(_sp)
+                    _sp.loader.exec_module(_wm)
+                    if _wm._port_open("127.0.0.1", 7890):
+                        _dl_bin = _wm._auto_install_claude_via_proxy("http://127.0.0.1:7890")
+                        if _dl_bin and os.path.isfile(_dl_bin):
+                            claude_bin = _dl_bin
+                except Exception:
+                    pass
         pc_bin = ""
         gost_bin = shutil.which("gost.exe") or os.path.join(REAL_HOME, ".local", "bin", "gost.exe")
     else:
@@ -1445,6 +1502,173 @@ sys.exit(0 if ok else 1)
             "新 IP 与 America/Los_Angeles 时区即时生效，userID/OAuth Token 零损保留，旧淘汰 IP 回用被精准拦截"
             if ok15
             else f"set-ip 实测异常: {setip_res.stderr or setip_res.stdout}",
+        )
+
+        # ------------------------------------------------------------------
+        # [16/16] Windows Claude Desktop (cc-desktop)：ant-did 物理隔离、远端 DNS/QUIC 阻断与 1s 断流熔断实测
+        # ------------------------------------------------------------------
+        desk_test_script = f"""
+import importlib.machinery, importlib.util, json, os, socket, stat, sys, threading, time
+
+fake_home = {json.dumps(fake_home)}
+fake_safe_root = {json.dumps(fake_safe_root)}
+sb_dir = {json.dumps(sb)}
+launcher_p = {json.dumps(sb_win_launcher)}
+
+os.environ["HOME"] = fake_home
+os.environ["USERPROFILE"] = fake_home
+os.environ["CC_AUDIT_SANDBOX"] = "1"
+os.environ["CC_SAFE_ROOT"] = fake_safe_root
+
+# 建立两个真实本地监听套接字模拟 Gost HTTP/SOCKS5h 端口在位
+s_http = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s_http.bind(("127.0.0.1", 0))
+s_http.listen(4)
+p_http = s_http.getsockname()[1]
+
+s_socks = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s_socks.bind(("127.0.0.1", 0))
+s_socks.listen(4)
+p_socks = s_socks.getsockname()[1]
+
+cfg_dir = os.path.join(fake_safe_root, "config")
+tun_json = os.path.join(cfg_dir, "us-tunnel.json")
+tun_hash = os.path.join(cfg_dir, "us-tunnel.sha256")
+json.dump({{"http_listen": f"127.0.0.1:{{p_http}}", "socks_listen": f"127.0.0.1:{{p_socks}}"}}, open(tun_json, "w", encoding="utf-8"))
+open(tun_hash, "w", encoding="utf-8").write("audit_hash_alpha_001\\n")
+
+# 编写模拟 Claude.exe 可执行桩 (记录 argv 与环境变量，并支持慢速阻塞供 Kill-Switch 熔断实测)
+dump_file = os.path.join(sb_dir, "desk_capture.json")
+breach_desk = os.path.join(sb_dir, "DESK_BREACH")
+mock_py = os.path.join(sb_dir, "mock_desktop_app.py")
+open(mock_py, "w", encoding="utf-8").write('''import json, os, sys, time
+if os.environ.get("MOCK_DESK_BREACH_TEST") == "1":
+    open(os.environ["MOCK_DESK_BREACH_FILE"], "w").write("1")
+    sys.exit(0)
+if os.environ.get("MOCK_DESK_SLEEP") == "1":
+    time.sleep(30)
+    sys.exit(0)
+json.dump({{"argv": sys.argv[1:], "env": dict(os.environ)}}, open(os.environ["MOCK_DESK_DUMP"], "w", encoding="utf-8"))
+sys.exit(0)
+''')
+
+if os.name == "nt":
+    mock_bin = os.path.join(sb_dir, "MockClaudeDesktop.cmd")
+    open(mock_bin, "w", encoding="utf-8").write(f'@echo off\\r\\n"{{sys.executable}}" "{{mock_py}}" %*\\r\\nexit /b %ERRORLEVEL%\\r\\n')
+else:
+    mock_bin = os.path.join(sb_dir, "MockClaudeDesktop")
+    open(mock_bin, "w", encoding="utf-8").write(f"#!/usr/bin/env bash\\nexec '{{sys.executable}}' '{{mock_py}}' \\"$@\\"\\n")
+    os.chmod(mock_bin, 0o755)
+
+os.environ["CC_DESKTOP_BIN"] = mock_bin
+os.environ["MOCK_DESK_DUMP"] = dump_file
+os.environ["MOCK_DESK_BREACH_FILE"] = breach_desk
+os.environ["GH_TOKEN"] = "poison_gh_desk_tok_999"
+os.environ["ANTHROPIC_CUSTOM_HEADERS"] = "x-poison: leak"
+os.environ["SSH_CONNECTION"] = "10.0.0.1 5555 10.0.0.2 22"
+os.environ["NO_PROXY"] = "*"
+
+loader = importlib.machinery.SourceFileLoader("cc_win_desk_audit", launcher_p)
+spec = importlib.util.spec_from_loader(loader.name, loader)
+wmod = importlib.util.module_from_spec(spec)
+loader.exec_module(wmod)
+
+sim_state = {{"ip": "198.51.100.11", "loc": "US"}}
+wmod._probe_trace = lambda proxy_url, timeout=6: {{"ip": sim_state["ip"], "loc": sim_state["loc"], "colo": "EWR"}}
+wmod._resolve_py_tool = lambda name: "/nonexistent_skip_helper"
+
+# 16A: 正常启动 + 邮箱寻址 + 命令行标志与隔离目录全量核验
+rc_ok = wmod.run_desktop(["alpha_user@isolated-a.example", "--no-chrome"])
+cap = json.load(open(dump_file, encoding="utf-8")) if os.path.isfile(dump_file) else {{"argv": [], "env": {{}}}}
+argv = cap["argv"]
+cenv = cap["env"]
+exp_ud = os.path.join(fake_safe_root, "profiles", "acc_alpha", "desktop", "user-data")
+cfg_j = os.path.join(fake_safe_root, "profiles", "acc_alpha", "desktop", "AppData", "Roaming", "Claude", "claude_desktop_config.json")
+cfg_raw = open(cfg_j, "rb").read() if os.path.isfile(cfg_j) else b"\\xef\\xbb\\xbf"
+
+ok_a = (
+    rc_ok == 0
+    and f"--user-data-dir={{exp_ud}}" in argv
+    and f"--proxy-server=http://127.0.0.1:{{p_http}}" in argv
+    and "--proxy-bypass-list=<-loopback>" in argv
+    and any(a.startswith("--host-resolver-rules=MAP * ~NOTFOUND") for a in argv)
+    and "--disable-quic" in argv
+    and "--force-webrtc-ip-handling-policy=disable_non_proxied_udp" in argv
+    and cenv.get("APPDATA", "").endswith(os.path.join("profiles", "acc_alpha", "desktop", "AppData", "Roaming"))
+    and cenv.get("LOCALAPPDATA", "").endswith(os.path.join("profiles", "acc_alpha", "desktop", "AppData", "Local"))
+    and cenv.get("USERPROFILE", "").endswith(os.path.join("profiles", "acc_alpha", "desktop", "home"))
+    and cenv.get("NO_PROXY") == "localhost,127.0.0.1,::1"
+    and "GH_TOKEN" not in cenv
+    and "ANTHROPIC_CUSTOM_HEADERS" not in cenv
+    and "SSH_CONNECTION" not in cenv
+    and not cfg_raw.startswith(b"\\xef\\xbb\\xbf")
+)
+
+# 16B: Fail-Close 阻断矩阵 (出口不匹配 + banned 状态 + 未激活账号禁自动切)
+os.environ["MOCK_DESK_BREACH_TEST"] = "1"
+sim_state["ip"] = "203.0.113.99"
+rc_mis = wmod.run_desktop(["acc_alpha", "--no-chrome"])
+
+sim_state["ip"] = "198.51.100.11"
+acc_p = os.path.join(cfg_dir, "accounts.json")
+ad = json.load(open(acc_p, encoding="utf-8"))
+ad["accounts"]["acc_alpha"]["status"] = "banned"
+json.dump(ad, open(acc_p, "w", encoding="utf-8"))
+rc_ban = wmod.run_desktop(["acc_alpha", "--no-chrome"])
+
+ad["accounts"]["acc_alpha"]["status"] = "active"
+json.dump(ad, open(acc_p, "w", encoding="utf-8"))
+os.environ["CC_NO_AUTO_SWITCH"] = "1"
+rc_inact = wmod.run_desktop(["acc_beta", "--no-chrome"])
+os.environ.pop("MOCK_DESK_BREACH_TEST", None)
+os.environ.pop("CC_NO_AUTO_SWITCH", None)
+
+ok_b = (rc_mis != 0 and rc_ban != 0 and rc_inact != 0 and not os.path.exists(breach_desk))
+
+# 16C: 1s 实时断流熔断看门狗 (运行中篡改/删除 us-tunnel.sha256 立即杀灭进程并返回非 0)
+os.environ["MOCK_DESK_SLEEP"] = "1"
+def _trip_hash():
+    time.sleep(1.3)
+    try:
+        os.remove(tun_hash)
+    except OSError:
+        pass
+threading.Thread(target=_trip_hash, daemon=True).start()
+t0 = time.monotonic()
+rc_ks = wmod.run_desktop(["acc_alpha", "--no-chrome"])
+dt = time.monotonic() - t0
+sess_left = [fn for fn in os.listdir(wmod.WIN_SESS_DIR) if fn.endswith(".json")] if os.path.isdir(wmod.WIN_SESS_DIR) else []
+ok_c = (rc_ks != 0 and dt < 8.0 and len(sess_left) == 0)
+
+# 16D: Windows GUI 路径排除校验 (_is_desktop_gui_path 严防将 MSIX/Squirrel 桌面端误判为 CLI)
+ok_d = (
+    wmod._is_desktop_gui_path(r"C:\\Users\\Admin\\AppData\\Local\\Microsoft\\WindowsApps\\Claude.exe")
+    and wmod._is_desktop_gui_path(r"C:\\Users\\Admin\\AppData\\Local\\AnthropicClaude\\claude.exe")
+    and not wmod._is_desktop_gui_path(r"C:\\Users\\Admin\\.local\\bin\\claude.exe")
+)
+
+s_http.close()
+s_socks.close()
+all_ok = ok_a and ok_b and ok_c and ok_d
+print(f"DESK_AUDIT_OK dt={{dt:.2f}}s" if all_ok else f"DESK_AUDIT_FAIL a={{ok_a}} b={{ok_b}} c={{ok_c}}(rc={{rc_ks}},dt={{dt:.2f}}) d={{ok_d}}")
+sys.exit(0 if all_ok else 1)
+"""
+        desk_res = subprocess.run(
+            [sys.executable, "-c", desk_test_script],
+            env=sb_env_base,
+            capture_output=True,
+            text=True,
+            timeout=16,
+        )
+        ok16 = desk_res.returncode == 0 and "DESK_AUDIT_OK" in desk_res.stdout
+        desk_last = (desk_res.stdout.strip().splitlines() or [""])[-1]
+        record(
+            16,
+            "Windows Claude Desktop (cc-desktop)：ant-did 物理隔离、远端 DNS/禁 QUIC 与 1s 断流熔断实测",
+            ok16,
+            f"独立 user-data/AppData 指纹空间 + MAP * ~NOTFOUND 远端 DNS + 禁 QUIC/WebRTC + 实时断流秒级熔断 ({desk_last})"
+            if ok16
+            else f"cc-desktop 实测异常: {desk_res.stderr or desk_res.stdout}",
         )
 
     finally:

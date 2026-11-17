@@ -1717,7 +1717,8 @@ def print_help():
   cc-switch win-proxy <on | off>                   开启/关闭 Tailscale 端口映射 (默认关闭，推荐 SSH -L 本地转发)
   cc-switch usage / reset                          查询实时 5h/7d 额度与 Reset 卡 / 一键使用 Reset 卡
   cc-switch import-session <关键词或UUID>          深度脱敏导入历史会话 (含 subagents 子会话与全域名邮箱脱敏)
-  cc-switch doctor / audit                         运行 8 项生产运行态自检 / 15 维真实抓包防泄漏审计
+  cc-switch desktop [别名] / chrome [别名]         [Windows] 启动专属物理隔离 Claude Desktop 客户端 / 同源隔离浏览器
+  cc-switch doctor / audit                         运行 8 项生产运行态自检 / 16 维真实抓包防泄漏审计
   cc-switch pass [别名] / totp [别名] [--raw]      输出指定账号密码 / 6 位 2FA 动态验证码
 ===================================================================================="""
     )
@@ -1766,10 +1767,19 @@ def cmd_status():
             st = v.get("status", "active")
             paths = profile_paths(k)
             exp, _ = parse_valid_cred(open(paths["cred"], "r", encoding="utf-8").read()) if os.path.exists(paths["cred"]) else (0, None)
+            desk_c1 = os.path.join(PROFILES_DIR, k, "desktop", "user-data", "Network", "Cookies")
+            desk_c2 = os.path.join(PROFILES_DIR, k, "desktop", "user-data", "Cookies")
+            has_desk = (os.path.isfile(desk_c1) and os.path.getsize(desk_c1) > 4096) or (
+                os.path.isfile(desk_c2) and os.path.getsize(desk_c2) > 4096
+            )
             if st == "banned":
                 state_tag = "🚫 已封禁 (熔断锁死)"
+            elif exp > 0 and has_desk:
+                state_tag = "✅ CLI+桌面端均已登录"
             elif exp > 0:
                 state_tag = "✅ 已登录 (切号/换IP免重登)"
+            elif has_desk:
+                state_tag = "✅ 桌面端已登录 (cc-desktop)"
             else:
                 state_tag = "⏳ 待首次登录"
             prefix = "👉 [当前] " if is_cur else "          "
@@ -1943,12 +1953,16 @@ def cmd_switch(target_key: str, force: bool = False):
         if old_key and old_key != target_key:
             print("⚠️  [浏览器防串号提醒] 若您电脑上仍开着旧账号的 Chrome 窗口，请先关闭后再打开新账号窗口！")
         if has_cred:
-            print(f"🎉 账号 [{target_key}] 已就绪，直接运行 `cc-safe` (或 `claude`) 即可进入专属隔离空间！")
+            desk_tip = "，或运行 `cc-desktop` 启动隔离桌面客户端" if IS_WINDOWS else ""
+            print(f"🎉 账号 [{target_key}] 已就绪，直接运行 `cc-safe` (或 `claude`){desk_tip} 即可进入专属隔离空间！")
         else:
             totp_code, _ = gen_totp(acc.get("totp", ""))
             print(f"⏳ 账号 [{target_key}] 尚未登录，请执行首次同源登录：")
             print(f"   1. 打开同源代理 Chrome: {_format_login_browser_hint(target_key, data)}")
-            print("   2. 终端运行 `cc-safe` 并输入 `/login`")
+            if IS_WINDOWS:
+                print("   2. 终端运行 `cc-safe` 输入 `/login`，或运行 `cc-desktop` 启动物理隔离的 Claude 桌面客户端 (点 Sign in with a code 粘贴登录码)")
+            else:
+                print("   2. 终端运行 `cc-safe` 并输入 `/login`")
             print(f"   3. 邮箱: {acc.get('email','')} | 密码: `cc-switch pass` | 2FA: {totp_code} (`cc-totp`)")
             print("   4. 登录成功后自动归档同步（也可手动运行 `cc-switch sync`）")
 
@@ -2399,6 +2413,18 @@ def cmd_add(raw_str: str, alias: str = None, force: bool = False):
 
     print(f"✅ 已录入新账号 [{alias}]: IP={ip} | 属地={loc} | 时区={tz}")
     cmd_switch(alias, force=force)
+    if IS_WINDOWS and not get_claude_version():
+        win_launcher = os.path.join(SAFE_DIR, "libexec", "py", "cc_win_launcher.py")
+        if os.path.isfile(win_launcher):
+            try:
+                import importlib.util as _ilu
+                _sp = _ilu.spec_from_file_location("cc_win_l", win_launcher)
+                _wm = _ilu.module_from_spec(_sp)
+                _sp.loader.exec_module(_wm)
+                if not _wm._find_claude_bin():
+                    _wm._auto_install_claude_via_proxy(PROXY_HTTP)
+            except Exception:
+                pass
 
 
 def cmd_set_ip(target_key: str = None, proxy_raw: str = None, force: bool = False):
@@ -2643,10 +2669,15 @@ def cmd_init_wizard():
         print("  [3] 🔀 切换当前激活账号       (双机进程清场 + 专线热切 + 双通道 US 核验)")
         print("  [4] 🖧  配置双机集群同步       (绑定对端服务器 IP 或切回单机模式)")
         print("  [5] 🛡️  运行 360° 防封防泄漏实测审计 (cc-audit) 与健康自检 (doctor)")
+        if IS_WINDOWS:
+            print("  [6] 🖥️  启动隔离 Claude Desktop 桌面客户端 (cc-desktop: 独立 ant-did + 实时断流熔断)")
+            print("  [7] 🌐 打开账号专属同源隔离浏览器         (cc-chrome: 远程 DNS + 禁 QUIC)")
         print("  [0] 退出向导")
-        choice = input("\n👉 请选择操作编号 [1/2/3/4/5/0]: ").strip()
+        prompt_nums = "1/2/3/4/5/6/7/0" if IS_WINDOWS else "1/2/3/4/5/0"
+        choice = input(f"\n👉 请选择操作编号 [{prompt_nums}]: ").strip()
         if choice in ("0", "q", "quit", "exit", ""):
-            print("👋 已退出向导。随时可运行 `cc-safe` (或 `claude`) 进入隔离会话！")
+            desk_exit_tip = " 或 `cc-desktop`" if IS_WINDOWS else ""
+            print(f"👋 已退出向导。随时可运行 `cc-safe`{desk_exit_tip} 进入隔离会话！")
             break
         elif choice == "1":
             try:
@@ -2682,12 +2713,21 @@ def cmd_init_wizard():
                 cmd_doctor()
             except SystemExit:
                 pass
-            run_aud = input("是否继续运行完整 15 维真实抓包防泄漏审计 `cc-audit`? [Y/n]: ").strip().lower()
+            run_aud = input("是否继续运行完整 16 维真实抓包防泄漏审计 `cc-audit`? [Y/n]: ").strip().lower()
             if run_aud in ("", "y", "yes"):
                 audit_bin = CC_AUDIT if os.path.exists(CC_AUDIT) else os.path.join(SELF_DIR, "cc-audit")
                 subprocess.call(_py_cmd(audit_bin))
+        elif IS_WINDOWS and choice in ("6", "7"):
+            if not active:
+                print("📭 当前尚未激活账号，请先选择 [1] 添加账号或 [3] 切换账号。")
+                continue
+            win_launcher = os.path.join(SAFE_DIR, "libexec", "py", "cc_win_launcher.py")
+            if not os.path.isfile(win_launcher):
+                win_launcher = os.path.join(os.path.dirname(SELF_DIR), "windows", "cc_win_launcher.py")
+            sub_mode = "desktop" if choice == "6" else "chrome"
+            subprocess.call([sys.executable, win_launcher, sub_mode, active])
         else:
-            print("⚠️ 无效选项，请输入 0~5。")
+            print(f"⚠️ 无效选项，请输入 0~{'7' if IS_WINDOWS else '5'}。")
 
 
 def _enforce_ban_lockdown(target_key: str):

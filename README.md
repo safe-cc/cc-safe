@@ -1,8 +1,8 @@
 # `cc-safe`
 
-Claude Code 多账号物理硬隔离、一键无损换 IP 与美国静态住宅 ISP 防封套件 (Linux & Windows)
+Claude Code CLI + Windows Claude Desktop 桌面端多账号物理硬隔离、一键无损换 IP 与美国静态住宅 ISP 防封套件 (Linux & Windows)
 
-`cc-safe` 是一套专为在 **Linux 服务器 / WSL2 / 原生 Windows 10 & 11** 环境下安全运营多个 Claude Pro / Max 个人订阅账号而设计的 **账号级物理硬隔离 + Fail-Close 美国家宽专线熔断 + 无损换 IP** 一键工具链，同时实现与 API 中转通道（`claude-sub2api`）的 100% 物理分离。
+`cc-safe` 是一套专为在 **Linux 服务器 / WSL2 / 原生 Windows 10 & 11** 环境下安全运营多个 Claude Pro / Max 个人订阅账号而设计的 **账号级物理硬隔离（同时支持命令行 `cc-safe` 与 Windows 原生桌面客户端 `cc-desktop`）+ Fail-Close 美国家宽专线熔断 + 无损换 IP** 一键工具链，同时实现与 API 中转通道（`claude-sub2api`）的 100% 物理分离。
 
 ---
 
@@ -29,9 +29,9 @@ curl -fsSL https://raw.githubusercontent.com/safe-cc/cc-safe/main/install.sh | b
 
 ---
 
-### 🪟 Windows 10 / 11 一键安装与启动（原生免管理员）
+### 🪟 Windows 10 / 11 一键安装与启动（原生免管理员，支持 CLI + Claude Desktop 桌面客户端）
 
-自动识别 `x64` / `ARM64`，免管理员自动部署独立版 `Python 3.12`、`gost.exe v3` 与 `claude` CLI，执行 NTFS 用户独占 ACL 权限加固，注册无窗口后台隧道自愈守护，并内置 `cc-chrome` 一键同源隔离浏览器：
+自动识别 `x64` / `ARM64`，免管理员自动部署独立版 `Python 3.12`、`gost.exe v3`（内置国内网络防 Schannel 吊销离线失败与 SHA-256 镜像回退）与 `claude` CLI，执行 NTFS 用户独占 ACL 权限加固，注册无窗口后台隧道自愈守护，并内置 **`cc-desktop`（Windows 原生 Claude Desktop 桌面客户端隔离）** 与 **`cc-chrome`（一键同源隔离浏览器）**：
 
 ```powershell
 # 推荐方式 1：Clone 后直接双击 quickstart.cmd，或在终端运行：
@@ -42,8 +42,9 @@ cd cc-safe
 # 快捷子命令：
 .\quickstart.cmd add - acc1             # 安全隐藏输入添加新账号 acc1
 .\quickstart.cmd set-ip acc1 -          # 为已有账号 acc1 一键无损换 IP (免重新登录！)
+.\quickstart.cmd desktop acc1           # 一键启动物理隔离的 Windows Claude Desktop 桌面客户端 (独立 ant-did + 断流熔断)
 .\quickstart.cmd chrome acc1            # 一键打开同源美国出口隔离浏览器 (远端 DNS + 禁 QUIC)
-.\quickstart.cmd audit                  # 运行 15 维 360° 防封防关联实测审计
+.\quickstart.cmd audit                  # 运行 16 维 360° 防封防关联实测审计
 
 # 方式 2：PowerShell 远程单行一键直装
 irm https://raw.githubusercontent.com/safe-cc/cc-safe/main/install.ps1 | iex
@@ -57,7 +58,9 @@ irm https://raw.githubusercontent.com/safe-cc/cc-safe/main/install.ps1 | iex
 - `[2]` **给已有账号一键无损换 IP**（保留设备指纹与已登录 OAuth 凭证，**免重新登录**！）
 - `[3]` **秒切当前激活账号**（旧会话进程树清场 + Gost 专线热切 + HTTP/SOCKS5h 双通道 US 核验）
 - `[4]` **配置双机集群同步**（双向绑定对端服务器 IP）
-- `[5]` **运行 15 维 360° 真实抓包防泄漏实测 (`cc-audit`)**
+- `[5]` **运行 16 维 360° 真实抓包防泄漏实测 (`cc-audit`)**
+- `[6]` **[Windows] 启动隔离 Claude Desktop 桌面客户端 (`cc-desktop`)**
+- `[7]` **[Windows] 打开账号专属同源隔离浏览器 (`cc-chrome`)**
 
 ---
 
@@ -106,6 +109,7 @@ cc-switch set-ip acc1 "isp-new.example.com:10001:user:pass"
         ├── identity.json                     <-- 账号专属 6 维设备指纹锚点 (0600)
         ├── gitconfig                         <-- 账号专属 GIT_CONFIG_GLOBAL
         ├── browser-profile/                  <-- [Windows] cc-chrome 独占浏览器目录 (继承 NTFS ACL)
+        ├── desktop/                          <-- [Windows] cc-desktop 独占桌面客户端空间 (独立 ant-did / Cookies / AppData)
         └── home/                             <-- CLAUDE_CONFIG_DIR / HOME / APPDATA 物理独占目录 (零跨号软链！)
             ├── .claude.json                  <-- 白名单纯净配置 (锁死自动更新与 GrowthBook 遥测)
             ├── .credentials.json             <-- 该账号独占 OAuth Token (0600)
@@ -126,9 +130,15 @@ cc-switch set-ip acc1 "isp-new.example.com:10001:user:pass"
 
 ---
 
-## 四、 新账号首次同源 OAuth 登录（仅需一次，换 IP 与双机均免重登）
+## 四、 新账号首次同源 OAuth 登录与 Windows `cc-desktop` 桌面客户端防封指南
 
-- **在 Windows 本机直接运行 `cc-safe` 时（最简单）**：
+- **在 Windows 本机使用官方 `Claude Desktop` 桌面图形客户端 (`cc-desktop`)**：
+  1. 先从 [claude.ai/download](https://claude.ai/download) 安装官方 Windows 版 Claude Desktop（支持 Microsoft Store MSIX 与独立安装包）；**注意：日常严禁从开始菜单或桌面图标直接裸开 Claude，务必通过 `cc-desktop` 启动！**
+  2. **首次登录防漏两步法**（避免触发系统默认未代理浏览器直连泄漏与 `claude://` 跨实例串号）：
+     - 第一步：终端运行 `cc-chrome <账号别名>` 打开同源美国 IP 隔离浏览器；
+     - 第二步：运行 `cc-desktop <账号别名>` 启动该账号专属物理隔离的桌面端（每个账号拥有独立 `ant-did` 设备指纹、强制 `--proxy-server`、强制 `MAP * ~NOTFOUND` 远端 DNS、禁用 QUIC 与 WebRTC 非代理 UDP，并自动清理托盘异号残留进程 + 1 秒级断流熔断守护）；
+     - 若点击登录弹出了系统默认浏览器，立即关闭该窗口并将登录 URL 粘贴进已打开的 `cc-chrome` 隔离浏览器；验证邮箱后弹出 `"Open Claude?"` 时点 **【取消 / Cancel】**，直接点击网页上的 **【Sign in with a code / 使用验证码登录】** 粘贴回桌面客户端即可！此后每次直接运行 `cc-desktop <账号别名>` 免重登！
+- **在 Windows 本机直接运行命令行 `cc-safe` 时**：
   1. 终端运行 `cc-chrome <账号别名>` —— 自动校验当前美国出口后拉起独立数据目录 Chrome/Edge（自动附带 `--host-resolver-rules=MAP * ~NOTFOUND` 强制远端 DNS 解析 + `--disable-quic` 阻断 UDP 泄漏）；
   2. 再运行 `cc-safe`，输入 `/login` 在该隔离浏览器窗口内完成授权（密码可运行 `cc-switch pass` 查看，2FA 动态码运行 `cc-totp` 获取）。
 - **在远程 Linux 服务器运行 `cc-safe` 时**：
@@ -147,10 +157,10 @@ cc-switch set-ip acc1 "isp-new.example.com:10001:user:pass"
 ```bash
 # 快速开始与状态自检
 ./quickstart.sh / .\quickstart.cmd        # Clone 后一键安装并打开交互式向导菜单
-cc-switch init                            # 随时打开交互式向导 (上号 / 换 IP / 切号 / 审计)
-cc-switch status                          # 查看账号池、出口 IP、历史换 IP 次数与 2FA 动态码
+cc-switch init                            # 随时打开交互式向导 (上号 / 换 IP / 切号 / 桌面端 / 审计)
+cc-switch status                          # 查看账号池、CLI/桌面端登录态、出口 IP 与 2FA 动态码
 cc-switch doctor                          # 运行 8 项生产运行态健康与双机一致性自检
-cc-audit                                  # 运行 15 维 360° 真实抓包 + 熔断 + 换 IP 防封审计
+cc-audit                                  # 运行 16 维 360° 真实抓包 + 熔断 + 换 IP + Desktop 防封审计
 cc-audit --repo-only                      # 扫描仓库工作区与全量 Git 历史零本机隐私泄漏 (内置 pre-push 钩子)
 
 # 账号录入、无损换 IP 与代理体检 (推荐加 `-` 使用隐藏输入，零历史留痕)
@@ -158,12 +168,13 @@ cc-check-ip -                             # 隐藏输入代理，单独执行 5 
 cc-switch add - [别名]                    # 隐藏输入邮箱/密码/2FA/代理并激活新账号
 cc-switch set-ip [别名] -                 # 隐藏输入新代理，无损更换账号出口 IP (保留指纹与登录态！)
 
-# 会话启动、同源浏览器、切号与封禁熔断
+# 会话启动、隔离桌面端、同源浏览器、切号与封禁熔断
 cc-switch <账号别名>                      # 进程树清场 -> 切换 Gost 专线 -> 双通道核验 -> 同步对端
-cc-safe                                   # 启动当前激活账号的物理隔离 Claude Code 会话 (已设 claude 别名保护)
+cc-safe                                   # 启动当前激活账号的物理隔离 Claude Code CLI 会话 (已设 claude 别名保护)
+cc-desktop [账号别名] [--switch]          # [Windows] 启动物理隔离的 Claude Desktop 桌面客户端 (空闲自动切专线 + 1s 断流熔断)
 cc-chrome [账号别名]                      # [Windows] 一键打开该账号专属同源美国 IP 隔离浏览器
 claude-sub2api                            # 启动完全物理分离的中转通道 Claude Code (~/.claude)
-cc-switch kill                            # 一键清零全部 cc-safe / MCP 残留子进程树
+cc-switch kill                            # 一键清零全部 cc-safe / Desktop / MCP 残留子进程树
 cc-switch ban <别名> / unban <别名>       # 封禁熔断锁死隧道 (防自愈任务复活) / 解除封禁
 cc-switch rm <别名> [--purge]             # 移除账号配置 (--purge 同时删除其本地隔离档案目录)
 

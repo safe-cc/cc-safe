@@ -1066,7 +1066,7 @@ def _find_claude_desktop_bin() -> str:
             ],
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=12,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         iloc = (ps.stdout or "").strip()
@@ -1171,6 +1171,44 @@ def _kill_unmanaged_desktop_procs(exclude_pids: set = None) -> int:
     return killed
 
 
+def _count_live_win_sessions(exclude_account: str = "") -> tuple:
+    """统计 WIN_SESS_DIR 中当前仍存活的受管会话数与所属账号集合 (支持 NT CreateTime 防 PID 复用误判)。"""
+    alive_cnt = 0
+    alive_accs = set()
+    if not os.path.isdir(WIN_SESS_DIR):
+        return 0, alive_accs
+    for fn in os.listdir(WIN_SESS_DIR):
+        if not fn.endswith(".json"):
+            continue
+        fp = os.path.join(WIN_SESS_DIR, fn)
+        try:
+            info = json.load(open(fp, "r", encoding="utf-8"))
+        except Exception:
+            continue
+        acc_name = str(info.get("account") or "").strip()
+        if exclude_account and acc_name == exclude_account:
+            continue
+        pid = int(info.get("pid") or 0)
+        exp_ct = int(info.get("create_time") or 0)
+        if pid <= 0 or pid == os.getpid():
+            continue
+        is_live = False
+        if IS_WINDOWS:
+            cur_ct = _get_win_proc_create_time(pid)
+            is_live = cur_ct > 0 and (exp_ct == 0 or cur_ct == exp_ct)
+        else:
+            try:
+                os.kill(pid, 0)
+                is_live = True
+            except OSError:
+                is_live = False
+        if is_live:
+            alive_cnt += 1
+            if acc_name:
+                alive_accs.add(acc_name)
+    return alive_cnt, alive_accs
+
+
 def run_desktop(args: list) -> int:
     if not os.path.isfile(ACCOUNTS_FILE):
         print("❌ [CC-Desktop] 未找到 accounts.json，请先运行 `cc-switch init` 添加账号。", file=sys.stderr)
@@ -1186,7 +1224,8 @@ def run_desktop(args: list) -> int:
 
     accs = d.get("accounts") or {}
     no_chrome_hint = "--no-chrome" in args
-    filtered_args = [a for a in args if a != "--no-chrome"]
+    force_switch = "--switch" in args
+    filtered_args = [a for a in args if a not in ("--no-chrome", "--switch")]
 
     extra_electron_args = []
     if filtered_args and not filtered_args[0].startswith("-"):
@@ -1204,11 +1243,38 @@ def run_desktop(args: list) -> int:
                 break
 
     if not target or target not in accs:
-        print(f"❌ [CC-Desktop] 未找到目标账号 '{raw_target}'。用法: cc-desktop [账号别名或邮箱]", file=sys.stderr)
+        print(f"❌ [CC-Desktop] 未找到目标账号 '{raw_target}'。用法: cc-desktop [账号别名或邮箱] [--switch]", file=sys.stderr)
         return 1
+
+    target_cfg = accs[target] if isinstance(accs.get(target), dict) else {}
+    if target_cfg.get("status") == "banned":
+        print(f"🚫 [CC-Desktop 熔断] 账号 [{target}] 已处于封禁 (banned) 状态，严禁启动桌面客户端！", file=sys.stderr)
+        return 1
+    if not str(target_cfg.get("ip") or "").strip() or str(target_cfg.get("ip")).strip() == "未知":
+        print(f"❌ [CC-Desktop 熔断] 账号 [{target}] 未绑定 EXPECTED_IP，拒绝启动！", file=sys.stderr)
+        return 1
+
+    clean_helper_env = dict(os.environ)
+    _pop_env_ci(clean_helper_env, ("CC_SAFE_MANAGED", "CC_SAFE_ACCOUNT", "NO_PROXY"))
+    sw_py = _resolve_py_tool("cc-switch")
+    tun_py = _resolve_py_tool("cc-us-tunnel")
+
     if d.get("active") != target:
-        print(f"⚠️  账号 [{target}] 当前未激活！请先运行 `cc-switch {target}` 切换专线后再启动 Claude Desktop。", file=sys.stderr)
-        return 1
+        live_cnt, live_accs = _count_live_win_sessions(exclude_account=target)
+        if not force_switch and (live_cnt > 0 or os.environ.get("CC_NO_AUTO_SWITCH") == "1"):
+            running_hint = f" (当前活跃会话: {', '.join(sorted(live_accs))})" if live_accs else ""
+            print(
+                f"⚠️  账号 [{target}] 当前未激活{running_hint}！请先关闭旧会话并运行 `cc-switch {target}`，或使用 `cc-desktop {target} --switch` 强制切号清场。",
+                file=sys.stderr,
+            )
+            return 1
+        if not os.path.isfile(sw_py):
+            print(f"⚠️  账号 [{target}] 当前未激活！请先运行 `cc-switch {target}` 切换专线。", file=sys.stderr)
+            return 1
+        print(f"🔀 [CC-Desktop] 当前空闲，正在自动将美国家宽专线切换至账号 [{target}] ...")
+        if subprocess.run([sys.executable, sw_py, target], env=clean_helper_env).returncode != 0:
+            print(f"❌ [CC-Desktop 熔断] 自动切换至账号 [{target}] 失败，已阻断启动！", file=sys.stderr)
+            return 1
 
     meta = _read_active_meta()
     if not meta.get("ok") or meta.get("account") != target:
@@ -1227,11 +1293,6 @@ def run_desktop(args: list) -> int:
         print("❌ [CC-Desktop] 未检测到 Windows 版 Claude Desktop 客户端 (Claude.exe)！", file=sys.stderr)
         print("   请先从 https://claude.ai/download 安装官方桌面客户端，再使用 `cc-desktop` 启动。", file=sys.stderr)
         return 1
-
-    clean_helper_env = dict(os.environ)
-    _pop_env_ci(clean_helper_env, ("CC_SAFE_MANAGED", "CC_SAFE_ACCOUNT", "NO_PROXY"))
-    sw_py = _resolve_py_tool("cc-switch")
-    tun_py = _resolve_py_tool("cc-us-tunnel")
     if os.path.isfile(tun_py):
         if subprocess.run([sys.executable, tun_py, "ensure"], env=clean_helper_env).returncode != 0:
             print("❌ [CC-Desktop 熔断] 本地美国家宽隧道启动失败！", file=sys.stderr)
@@ -1278,7 +1339,21 @@ def run_desktop(args: list) -> int:
     desk_local = os.path.join(desk_root, "AppData", "Local")
     desk_claude_cfg_dir = os.path.join(desk_roaming, "Claude")
     desk_claude_data_dir = os.path.join(desk_local, "Claude-Data")
-    for _dd in (prof_cli_home, desk_home, desk_user_data, desk_roaming, desk_local, desk_claude_cfg_dir, desk_claude_data_dir):
+    desk_xdg_cfg = os.path.join(desk_home, ".config")
+    desk_xdg_cache = os.path.join(desk_home, ".cache")
+    desk_xdg_state = os.path.join(desk_home, ".local", "state")
+    for _dd in (
+        prof_cli_home,
+        desk_home,
+        desk_user_data,
+        desk_roaming,
+        desk_local,
+        desk_claude_cfg_dir,
+        desk_claude_data_dir,
+        desk_xdg_cfg,
+        desk_xdg_cache,
+        desk_xdg_state,
+    ):
         os.makedirs(_dd, mode=0o700, exist_ok=True)
 
     desk_cfg_json = os.path.join(desk_claude_cfg_dir, "claude_desktop_config.json")
@@ -1294,6 +1369,7 @@ def run_desktop(args: list) -> int:
             "ANTHROPIC_AUTH_TOKEN",
             "ANTHROPIC_API_KEY",
             "ANTHROPIC_CUSTOM_HEADERS",
+            "BROWSER",
             "CLAUDE_SUB2API_MANAGED",
             "CLAUDE_CODE_OAUTH_TOKEN",
             "CLAUDE_CODE_ENABLE_TELEMETRY",
@@ -1301,6 +1377,13 @@ def run_desktop(args: list) -> int:
             "OTEL_EXPORTER_OTLP_HEADERS",
             "CLAUDE_CODE_ORGANIZATION_UUID",
             "CLAUDE_CODE_ACCOUNT_UUID",
+            "CLAUDE_CODE_HARBOR_KITE_CLOUD",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "FTP_PROXY",
+            "RSYNC_PROXY",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG_SYSTEM",
             "HTTPS_PROXY",
             "HTTP_PROXY",
             "ALL_PROXY",
@@ -1310,8 +1393,38 @@ def run_desktop(args: list) -> int:
             "USERPROFILE",
             "APPDATA",
             "LOCALAPPDATA",
+            "XDG_CONFIG_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_STATE_HOME",
         ),
     )
+
+    if _get_env_ci(run_env, "CC_SAFE_KEEP_HOST_TOKENS") != "1":
+        _pop_env_ci(
+            run_env,
+            (
+                "GH_TOKEN",
+                "GITHUB_TOKEN",
+                "GH_ENTERPRISE_TOKEN",
+                "GITLAB_TOKEN",
+                "GLAB_TOKEN",
+                "SSH_CONNECTION",
+                "SSH_CLIENT",
+                "SSH_TTY",
+                "TMUX",
+                "TMUX_PANE",
+                "AWS_ACCESS_KEY_ID",
+                "AWS_SECRET_ACCESS_KEY",
+                "AWS_SESSION_TOKEN",
+                "AWS_PROFILE",
+                "AZURE_CONFIG_DIR",
+                "GOOGLE_APPLICATION_CREDENTIALS",
+                "CLOUDSDK_CONFIG",
+            ),
+        )
+        desk_gh_dir = os.path.join(desk_xdg_cfg, "gh")
+        os.makedirs(desk_gh_dir, exist_ok=True)
+        run_env["GH_CONFIG_DIR"] = desk_gh_dir
 
     libexec_dir = os.path.join(SAFE_DIR, "libexec")
     cur_path = _get_env_ci(run_env, "PATH")
@@ -1337,6 +1450,9 @@ def run_desktop(args: list) -> int:
             "USERPROFILE": desk_home,
             "APPDATA": desk_roaming,
             "LOCALAPPDATA": desk_local,
+            "XDG_CONFIG_HOME": desk_xdg_cfg,
+            "XDG_CACHE_HOME": desk_xdg_cache,
+            "XDG_STATE_HOME": desk_xdg_state,
             "CC_SAFE_MANAGED": "1",
             "CC_SAFE_ACCOUNT": target,
             "CC_SAFE_ROOT": SAFE_DIR,
@@ -1362,6 +1478,8 @@ def run_desktop(args: list) -> int:
             "DISABLE_ERROR_REPORTING": "1",
             "DISABLE_AUTOUPDATER": "1",
             "DISABLE_GROWTHBOOK": "1",
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+            "CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL": "1",
         }
     )
 
@@ -1405,7 +1523,15 @@ def run_desktop(args: list) -> int:
     stop_evt = threading.Event()
     killswitch_tripped = threading.Event()
 
-    proc = subprocess.Popen(d_args, env=run_env)
+    try:
+        proc = subprocess.Popen(d_args, env=run_env)
+    except PermissionError:
+        alias_exe = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "WindowsApps", "Claude.exe")
+        if IS_WINDOWS and alias_exe and os.path.isfile(alias_exe) and os.path.normcase(alias_exe) != os.path.normcase(desktop_bin):
+            d_args[0] = alias_exe
+            proc = subprocess.Popen(d_args, env=run_env)
+        else:
+            raise
     _assign_pid_to_job(h_job, proc.pid)
 
     marker_file = _write_session_marker(

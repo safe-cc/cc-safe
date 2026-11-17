@@ -287,50 +287,60 @@ if (-not $NeedGost) {
 if ($NeedGost) {
     Write-Host "⬇️  正在下载安装 gost v3 ($ArchTag) -> $GostExe ..." -ForegroundColor Cyan
     $GostUrl = "https://github.com/go-gost/gost/releases/download/v${GostFallbackVer}/gost_${GostFallbackVer}_windows_${ArchTag}.zip"
-    $GostDigest = ""
+    $GostDigest = if ($ArchTag -eq "amd64") {
+        "sha256:b00441624a66ebed94a2ddcc01ab2832069f053e6ca0abf19d7104b84fad1f78"
+    } else {
+        "sha256:9bdba3d429dbaa1f926b1a2e75a5e35d427129c5ae9dbebcaf1a929d8ab570d6"
+    }
     try {
         $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/go-gost/gost/releases/latest" -Headers @{"User-Agent"="cc-safe-win"} -TimeoutSec 6
         foreach ($asset in $rel.assets) {
-            if ($asset.browser_download_url -match "windows_${ArchTag}\.zip$") {
-                $GostUrl = $asset.browser_download_url
-                if ($asset.PSObject.Properties["digest"] -and $asset.digest) {
-                    $GostDigest = [string]$asset.digest
-                }
+            if ($asset.browser_download_url -match "windows_${ArchTag}\.zip$" -and $asset.PSObject.Properties["digest"] -and ([string]$asset.digest -match '^sha256:[0-9a-fA-F]{64}$')) {
+                $GostUrl = [string]$asset.browser_download_url
+                $GostDigest = [string]$asset.digest
                 break
             }
         }
     } catch {}
+    $ExpectedHash = ($GostDigest -replace '^sha256:', '').Trim()
     $GostZip = Join-Path $RuntimeDir "gost_win.zip"
     $GostTmp = Join-Path $RuntimeDir "gost_tmp"
     if (Test-Path -LiteralPath $GostTmp) { Remove-Item -LiteralPath $GostTmp -Recurse -Force }
-    if (Test-Path -LiteralPath $GostZip) { Remove-Item -LiteralPath $GostZip -Force -ErrorAction SilentlyContinue }
-    & $SysCurl @CurlWinArgs $GostUrl -o $GostZip
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $GostZip)) {
-        Write-Host "⚠️  curl 下载 gost 未成功 (exit=$LASTEXITCODE)，切换 Python/PowerShell TLS 通道重试..." -ForegroundColor Yellow
+
+    $GostCandidateUrls = @(
+        $GostUrl,
+        "https://ghfast.top/$GostUrl",
+        "https://gh-proxy.com/$GostUrl"
+    )
+    $GostDownloaded = $false
+    $LastCurlCode = 0
+    foreach ($CandUrl in $GostCandidateUrls) {
+        if (Test-Path -LiteralPath $GostZip) { Remove-Item -LiteralPath $GostZip -Force -ErrorAction SilentlyContinue }
         $oldEapDl = $ErrorActionPreference
         try {
             $ErrorActionPreference = "Continue"
-            & $PythonExe -c "import sys, urllib.request; req=urllib.request.Request(sys.argv[1], headers={'User-Agent':'cc-safe-win'}); data=urllib.request.urlopen(req, timeout=60).read(); open(sys.argv[2],'wb').write(data)" $GostUrl $GostZip
+            & $SysCurl @CurlWinArgs --max-time 180 $CandUrl -o $GostZip
+            $LastCurlCode = $LASTEXITCODE
+            if ($LastCurlCode -ne 0 -or -not (Test-Path -LiteralPath $GostZip) -or ((Get-Item -LiteralPath $GostZip).Length -lt 1024)) {
+                & $PythonExe -c "import sys, urllib.request; req=urllib.request.Request(sys.argv[1], headers={'User-Agent':'cc-safe-win'}); data=urllib.request.urlopen(req, timeout=60).read(); open(sys.argv[2],'wb').write(data)" $CandUrl $GostZip 2>$null
+            }
         } catch {} finally {
             $ErrorActionPreference = $oldEapDl
         }
-        if (-not (Test-Path -LiteralPath $GostZip) -or ((Get-Item -LiteralPath $GostZip).Length -lt 1024)) {
-            try {
-                Invoke-WebRequest -Uri $GostUrl -OutFile $GostZip -UseBasicParsing
-            } catch {
-                Write-Error "❌ 下载 gost v3 失败，请检查目标机器到 GitHub Releases 的网络连接。"
-                exit 1
+        if ((Test-Path -LiteralPath $GostZip) -and ((Get-Item -LiteralPath $GostZip).Length -gt 1024)) {
+            $ActualHash = (Get-FileHash -LiteralPath $GostZip -Algorithm SHA256).Hash
+            if ($ActualHash -ieq $ExpectedHash) {
+                $GostDownloaded = $true
+                break
+            } else {
+                Write-Warning "候选源 SHA-256 校验未匹配 (预期=$ExpectedHash, 实际=$ActualHash)，自动切换下一源..."
+                Remove-Item -LiteralPath $GostZip -Force -ErrorAction SilentlyContinue
             }
         }
     }
-    if ($GostDigest -match '^sha256:([0-9a-fA-F]{64})$') {
-        $ExpectedHash = $Matches[1]
-        $ActualHash = (Get-FileHash -LiteralPath $GostZip -Algorithm SHA256).Hash
-        if ($ActualHash -ine $ExpectedHash) {
-            Remove-Item -LiteralPath $GostZip -Force -ErrorAction SilentlyContinue
-            Write-Error "❌ gost.zip SHA-256 完整性校验未通过 (预期=$ExpectedHash, 实际=$ActualHash)！"
-            exit 1
-        }
+    if (-not $GostDownloaded) {
+        Write-Error "❌ 下载或校验 gost v3 失败 (最后 curl 退出码: $LastCurlCode)，请检查网络连接。"
+        exit 1
     }
     Expand-Archive -LiteralPath $GostZip -DestinationPath $GostTmp -Force
     $FoundGost = Get-ChildItem -Path $GostTmp -Filter "gost.exe" -Recurse | Select-Object -First 1
@@ -341,11 +351,23 @@ if ($NeedGost) {
     Copy-Item -LiteralPath $FoundGost.FullName -Destination $GostExe -Force
     Remove-Item -LiteralPath $GostZip -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $GostTmp -Recurse -Force -ErrorAction SilentlyContinue
-    Write-Host "✅ gost v3 已安装: $GostExe" -ForegroundColor Green
+    Write-Host "✅ gost v3 已安装 (SHA-256 已核验): $GostExe" -ForegroundColor Green
 }
 
 $env:Path = "$BinDst;$env:Path"
-$HasClaude = [bool](Get-Command claude.exe -ErrorAction SilentlyContinue) -or [bool](Get-Command claude.cmd -ErrorAction SilentlyContinue) -or (Test-Path -LiteralPath (Join-Path $BinDst "claude.exe"))
+function Test-HasClaudeCli {
+    if (Test-Path -LiteralPath (Join-Path $BinDst "claude.exe")) { return $true }
+    foreach ($cn in @("claude.exe", "claude.cmd")) {
+        $found = Get-Command $cn -All -ErrorAction SilentlyContinue
+        foreach ($f in $found) {
+            if ($f.Source -and ($f.Source -notmatch "WindowsApps|AnthropicClaude")) {
+                return $true
+            }
+        }
+    }
+    return $false
+}
+$HasClaude = Test-HasClaudeCli
 if (-not $SkipClaude -and -not $HasClaude) {
     Write-Host "⬇️  未检测到 Claude Code CLI，正在尝试自动下载官方 Windows 原生版 ..." -ForegroundColor Cyan
     $ClaudePlat = if ($ArchTag -eq "arm64") { "win32-arm64" } else { "win32-x64" }
@@ -382,9 +404,10 @@ if (-not $SkipClaude -and -not $HasClaude) {
         }
     } catch {} finally {
         $ErrorActionPreference = $oldEapCc
+        $global:LASTEXITCODE = 0
     }
     if (-not $HasClaude) {
-        Write-Warning "当前直连尚未拉取到 Claude Code CLI（添加美国代理账号后首次运行 cc-safe 将自动通过专线补齐安装）。"
+        Write-Warning "当前直连尚未拉取到 Claude Code CLI（若仅使用 Claude Desktop 可直接用 cc-desktop；添加美国代理账号后也可随时补装 CLI）。"
     }
 }
 

@@ -67,6 +67,7 @@ switch ($FirstArg.ToLowerInvariant()) {
   .\quickstart.cmd                              一键安装全部依赖 + 打开交互式向导 (添加账号 / 无损换 IP / 切号 / 自检)
   .\quickstart.cmd set-ip [账号] [新代理|-]     一键无损更换已有账号的静态住宅 IP (保留设备指纹与登录态免重登！)
   .\quickstart.cmd add [- | '账号串'] [别名]    安全隐藏输入添加并激活新账号
+  .\quickstart.cmd desktop [账号]               启动该账号专属物理隔离的 Windows Claude Desktop 桌面客户端 (独立 ant-did + 断流熔断)
   .\quickstart.cmd chrome [账号]                打开该账号专属同源美国 IP 隔离浏览器 (远程 DNS + 禁 QUIC)
   .\quickstart.cmd status                       查看所有账号状态、出口 IP 与 2FA 动态验证码
   .\quickstart.cmd audit                        运行防泄漏与防关联实测审计
