@@ -1,0 +1,469 @@
+#!/usr/bin/env python3
+"""
+cc-us-tunnel: Fail-Close Gost v3 Tunnel Manager for cc-safe
+- Zero credentials in /proc/<pid>/cmdline: renders chmod-600 gost.json and launches `gost -C gost.json`
+- Zero hardcoded fallback proxy: refuses to start if active proxy config is missing/invalid
+- SHA-256 config state verification: auto-restarts Gost whenever upstream/listen config changes
+- flock mutex with non-blocking `start` (for cron) and blocking `ensure` (for cc-safe startup)
+"""
+import fcntl
+import glob
+import hashlib
+import json
+import os
+import re
+import signal
+import socket
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from urllib.parse import unquote, urlsplit
+
+HOME = os.path.expanduser("~")
+os.environ["PATH"] = f"{HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin:" + os.environ.get("PATH", "")
+
+SAFE_DIR = os.path.join(HOME, ".claude-safe")
+CFG_DIR = os.path.join(SAFE_DIR, "config")
+LOG_DIR = os.path.join(SAFE_DIR, "logs")
+LOCK_DIR = os.path.join(SAFE_DIR, "locks")
+
+TUNNEL_JSON = os.path.join(CFG_DIR, "us-tunnel.json")
+LEGACY_ENV = os.path.join(CFG_DIR, "us-tunnel.env")
+GOST_CFG = os.path.join(CFG_DIR, "gost.json")
+PID_FILE = os.path.join(CFG_DIR, "us-tunnel.pid")
+HASH_FILE = os.path.join(CFG_DIR, "us-tunnel.sha256")
+LOG_FILE = os.path.join(LOG_DIR, "us-tunnel.log")
+LOCK_FILE = os.path.join(LOCK_DIR, "tunnel.lock")
+
+for _d in (SAFE_DIR, CFG_DIR, LOG_DIR, LOCK_DIR):
+    os.makedirs(_d, mode=0o700, exist_ok=True)
+
+
+def find_gost_bin() -> str:
+    local_gost = os.path.join(HOME, ".local", "bin", "gost")
+    if os.path.isfile(local_gost) and os.access(local_gost, os.X_OK):
+        return local_gost
+    for p in os.environ.get("PATH", "").split(":"):
+        cand = os.path.join(p, "gost")
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return local_gost
+
+
+def atomic_write(path: str, content: str, mode: int = 0o600):
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(content)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def redact_proxy(proxy_url: str) -> str:
+    if not proxy_url:
+        return "未配置"
+    try:
+        u = urlsplit(proxy_url if "://" in proxy_url else f"http://{proxy_url}")
+        host = u.hostname or ""
+        port = f":{u.port}" if u.port else ""
+        return f"{u.scheme}://{host}{port}"
+    except Exception:
+        return "<redacted>"
+
+
+def detect_tailscale_ip() -> str:
+    try:
+        res = subprocess.run(["tailscale", "ip", "-4"], capture_output=True, text=True, timeout=2)
+        if res.returncode == 0 and res.stdout.strip():
+            return res.stdout.strip().splitlines()[0].strip()
+    except Exception:
+        pass
+    return ""
+
+
+def load_tunnel_cfg() -> dict:
+    cfg = {
+        "active_account": "",
+        "expected_ip": "",
+        "us_proxy": "",
+        "http_listen": "127.0.0.1:7890",
+        "socks_listen": "127.0.0.1:7891",
+        "expose_tailscale_proxy": True,
+        "tailscale_http_listen": "",
+    }
+    if os.path.exists(TUNNEL_JSON):
+        try:
+            with open(TUNNEL_JSON, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                cfg.update(loaded)
+        except Exception:
+            pass
+    elif os.path.exists(LEGACY_ENV):
+        try:
+            with open(LEGACY_ENV, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    v = v.strip().strip('"').strip("'")
+                    k_map = {
+                        "ACTIVE_ACCOUNT": "active_account",
+                        "EXPECTED_IP": "expected_ip",
+                        "US_PROXY": "us_proxy",
+                        "HTTP_LISTEN": "http_listen",
+                        "SOCKS_LISTEN": "socks_listen",
+                        "TAILSCALE_HTTP_LISTEN": "tailscale_http_listen",
+                    }
+                    if k.strip() in k_map:
+                        cfg[k_map[k.strip()]] = v
+        except Exception:
+            pass
+
+    if cfg.get("expose_tailscale_proxy", True) and not cfg.get("tailscale_http_listen"):
+        ts_ip = detect_tailscale_ip()
+        if ts_ip:
+            port = (cfg.get("http_listen") or "127.0.0.1:7890").rsplit(":", 1)[-1]
+            cfg["tailscale_http_listen"] = f"{ts_ip}:{port}"
+    elif not cfg.get("expose_tailscale_proxy", True):
+        cfg["tailscale_http_listen"] = ""
+    return cfg
+
+
+def build_gost_config(cfg: dict) -> tuple:
+    raw_proxy = (cfg.get("us_proxy") or "").strip()
+    if not raw_proxy:
+        return None, ""
+    if "://" not in raw_proxy:
+        raw_proxy = f"http://{raw_proxy}"
+    parsed = urlsplit(raw_proxy)
+    scheme = (parsed.scheme or "http").lower()
+    host = parsed.hostname
+    port = parsed.port
+    if not host or not port:
+        return None, ""
+
+    connector_type = "socks5" if scheme.startswith("socks5") else "http"
+    dialer_type = "tls" if scheme == "https" else "tcp"
+
+    node = {
+        "name": "node-0",
+        "addr": f"{host}:{port}",
+        "connector": {"type": connector_type},
+        "dialer": {"type": dialer_type, "tls": {"serverName": host}},
+    }
+    if parsed.username is not None or parsed.password is not None:
+        node["connector"]["auth"] = {
+            "username": unquote(parsed.username or ""),
+            "password": unquote(parsed.password or ""),
+        }
+
+    services = [
+        {
+            "name": "http-local",
+            "addr": cfg["http_listen"],
+            "handler": {"type": "http", "chain": "chain-0"},
+            "listener": {"type": "tcp"},
+        }
+    ]
+    if cfg.get("tailscale_http_listen"):
+        services.append(
+            {
+                "name": "http-tailscale",
+                "addr": cfg["tailscale_http_listen"],
+                "handler": {"type": "http", "chain": "chain-0"},
+                "listener": {"type": "tcp"},
+            }
+        )
+    services.append(
+        {
+            "name": "socks5-local",
+            "addr": cfg["socks_listen"],
+            "handler": {"type": "socks5", "chain": "chain-0"},
+            "listener": {"type": "tcp"},
+        }
+    )
+
+    gost_obj = {
+        "services": services,
+        "chains": [
+            {
+                "name": "chain-0",
+                "hops": [
+                    {
+                        "name": "hop-0",
+                        "bypass": "bypass-local",
+                        "nodes": [node],
+                    }
+                ],
+            }
+        ],
+        "bypasses": [
+            {
+                "name": "bypass-local",
+                "matchers": ["100.64.0.0/10", "127.0.0.0/8", "::1/128", "localhost"],
+            }
+        ],
+    }
+    rendered = json.dumps(gost_obj, indent=2, sort_keys=True)
+    digest = hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+    return rendered, digest
+
+
+def is_port_listening(addr: str) -> bool:
+    try:
+        host, port_s = addr.rsplit(":", 1)
+        with socket.create_connection((host, int(port_s)), timeout=0.4):
+            return True
+    except Exception:
+        return False
+
+
+def find_our_gost_pids(http_listen: str = "127.0.0.1:7890") -> list:
+    uid = os.getuid()
+    pids = []
+    for pdir in glob.glob("/proc/[0-9]*"):
+        base = os.path.basename(pdir)
+        if not base.isdigit():
+            continue
+        pid = int(base)
+        try:
+            if os.stat(pdir).st_uid != uid:
+                continue
+            raw = open(f"{pdir}/cmdline", "rb").read()
+            argv = [x.decode("utf-8", "ignore") for x in raw.split(b"\x00") if x]
+            if not argv:
+                continue
+            exe_name = os.path.basename(argv[0])
+            cmd_join = " ".join(argv)
+            if exe_name == "gost" and (GOST_CFG in cmd_join or f"http://{http_listen}" in cmd_join):
+                pids.append(pid)
+        except Exception:
+            continue
+    return sorted(pids)
+
+
+def is_matching_running(cfg: dict, expected_digest: str) -> bool:
+    if not expected_digest:
+        return False
+    if not is_port_listening(cfg["http_listen"]) or not is_port_listening(cfg["socks_listen"]):
+        return False
+    pids = find_our_gost_pids(cfg["http_listen"])
+    if not pids:
+        return False
+    for pid in pids:
+        try:
+            cmd = open(f"/proc/{pid}/cmdline", "rb").read().decode("utf-8", "ignore")
+            if GOST_CFG not in cmd:
+                return False
+        except Exception:
+            return False
+    try:
+        running_hash = open(HASH_FILE, "r", encoding="utf-8").read().strip()
+    except Exception:
+        return False
+    return running_hash == expected_digest
+
+
+def stop_tunnel_unlocked(http_listen: str = "127.0.0.1:7890", socks_listen: str = "127.0.0.1:7891"):
+    if os.path.exists(PID_FILE):
+        try:
+            saved = int(open(PID_FILE, "r", encoding="utf-8").read().strip())
+            os.kill(saved, signal.SIGTERM)
+        except Exception:
+            pass
+        try:
+            os.remove(PID_FILE)
+        except OSError:
+            pass
+
+    pids = find_our_gost_pids(http_listen)
+    for p in pids:
+        try:
+            os.kill(p, signal.SIGTERM)
+        except Exception:
+            pass
+
+    deadline = time.time() + 1.0
+    while time.time() < deadline:
+        if not find_our_gost_pids(http_listen):
+            break
+        time.sleep(0.1)
+
+    for _ in range(15):
+        rem = find_our_gost_pids(http_listen)
+        if not rem and not is_port_listening(http_listen) and not is_port_listening(socks_listen):
+            break
+        for p in rem:
+            try:
+                os.kill(p, signal.SIGKILL)
+            except Exception:
+                pass
+        time.sleep(0.1)
+
+    try:
+        os.remove(HASH_FILE)
+    except OSError:
+        pass
+
+
+def start_tunnel_unlocked() -> int:
+    cfg = load_tunnel_cfg()
+    rendered, digest = build_gost_config(cfg)
+    if not rendered:
+        stop_tunnel_unlocked(cfg["http_listen"], cfg["socks_listen"])
+        print(f"❌ [Fail-Close] 未配置有效代理 ({TUNNEL_JSON})，拒绝启动隧道！", file=sys.stderr)
+        return 1
+
+    if is_matching_running(cfg, digest):
+        return 0
+
+    gost_bin = find_gost_bin()
+    if not os.path.isfile(gost_bin):
+        print(f"❌ 未找到 gost 可执行文件 ({gost_bin})，请运行 install.sh 自动安装。", file=sys.stderr)
+        return 1
+
+    stop_tunnel_unlocked(cfg["http_listen"], cfg["socks_listen"])
+    atomic_write(GOST_CFG, rendered, 0o600)
+
+    now_iso = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+    redacted = redact_proxy(cfg.get("us_proxy", ""))
+    with open(LOG_FILE, "a", encoding="utf-8") as lf:
+        lf.write(
+            f"[{now_iso}] Starting cc-us-tunnel account={cfg.get('active_account') or 'unknown'} "
+            f"-> {redacted} (expected_ip={cfg.get('expected_ip') or 'none'})\n"
+        )
+        lf.flush()
+        proc = subprocess.Popen(
+            [gost_bin, "-C", GOST_CFG],
+            stdin=subprocess.DEVNULL,
+            stdout=lf,
+            stderr=lf,
+            close_fds=True,
+            start_new_session=True,
+        )
+
+    atomic_write(PID_FILE, f"{proc.pid}\n", 0o600)
+    atomic_write(HASH_FILE, f"{digest}\n", 0o600)
+
+    for _ in range(16):
+        if is_matching_running(cfg, digest):
+            return 0
+        if proc.poll() is not None:
+            break
+        time.sleep(0.2)
+
+    print(f"❌ 启动 cc-us-tunnel 失败，请运行 `cc-us-tunnel logs` 查看 {LOG_FILE}", file=sys.stderr)
+    return 1
+
+
+def probe_trace(proxy_url: str, timeout: int = 6) -> dict:
+    cfg_stdin = f'proxy = "{proxy_url}"\nurl = "https://api.anthropic.com/cdn-cgi/trace"\n'
+    res = subprocess.run(
+        ["curl", "-s", "--max-time", str(timeout), "-K", "-"],
+        input=cfg_stdin,
+        capture_output=True,
+        text=True,
+    )
+    out = {}
+    for line in res.stdout.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
+def status_tunnel() -> int:
+    cfg = load_tunnel_cfg()
+    _, digest = build_gost_config(cfg)
+    if is_matching_running(cfg, digest):
+        pids = find_our_gost_pids(cfg["http_listen"])
+        ts_note = f" (Tailscale: http://{cfg['tailscale_http_listen']})" if cfg.get("tailscale_http_listen") else ""
+        print(f"✅ cc-us-tunnel ACTIVE (PID: {pids[0]} | 账号: {cfg.get('active_account') or '未知'})")
+        print(f"   Local HTTP  : http://{cfg['http_listen']}{ts_note}")
+        print(f"   Local SOCKS5: socks5://{cfg['socks_listen']}")
+        print(f"   Upstream    : {redact_proxy(cfg.get('us_proxy', ''))} | Expected IP: {cfg.get('expected_ip') or '未设置'}")
+        tr = probe_trace(f"http://{cfg['http_listen']}", timeout=6)
+        if tr.get("ip"):
+            print(f"   Live Trace  : ip={tr.get('ip')} | loc={tr.get('loc')} | colo={tr.get('colo')}")
+            if cfg.get("expected_ip") and tr.get("ip") != cfg["expected_ip"]:
+                print(f"   ❌ [告警] 实际出口 IP ({tr.get('ip')}) 与绑定 IP ({cfg['expected_ip']}) 不一致！")
+                return 2
+            return 0
+        print("   ⚠️ Warning: 上游代理连接超时或不可达！")
+        return 2
+    print("❌ cc-us-tunnel STOPPED (或与当前配置不匹配)")
+    return 1
+
+
+def with_lock(blocking: bool, timeout_sec: float = 10.0):
+    fd = open(LOCK_FILE, "w", encoding="utf-8")
+    if not blocking:
+        try:
+            fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            fd.close()
+            return None
+    deadline = time.time() + timeout_sec
+    while True:
+        try:
+            fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            if time.time() >= deadline:
+                fd.close()
+                raise TimeoutError("等待 tunnel.lock 超时")
+            time.sleep(0.1)
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) >= 2 else "start"
+    if cmd == "start":
+        fd = with_lock(blocking=False)
+        if fd is None:
+            sys.exit(0)
+        try:
+            sys.exit(start_tunnel_unlocked())
+        finally:
+            fd.close()
+    elif cmd == "ensure":
+        fd = with_lock(blocking=True, timeout_sec=12.0)
+        try:
+            sys.exit(start_tunnel_unlocked())
+        finally:
+            fd.close()
+    elif cmd == "stop":
+        fd = with_lock(blocking=True, timeout_sec=10.0)
+        try:
+            cfg = load_tunnel_cfg()
+            stop_tunnel_unlocked(cfg["http_listen"], cfg["socks_listen"])
+        finally:
+            fd.close()
+        print("🛑 cc-us-tunnel stopped.")
+    elif cmd == "restart":
+        fd = with_lock(blocking=True, timeout_sec=12.0)
+        try:
+            cfg = load_tunnel_cfg()
+            stop_tunnel_unlocked(cfg["http_listen"], cfg["socks_listen"])
+            time.sleep(0.15)
+            sys.exit(start_tunnel_unlocked())
+        finally:
+            fd.close()
+    elif cmd == "status":
+        sys.exit(status_tunnel())
+    elif cmd in ("logs", "log"):
+        if os.path.exists(LOG_FILE):
+            with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()[-50:]
+            sys.stdout.write("".join(lines))
+        else:
+            print("(暂无日志)")
+    else:
+        print("Usage: cc-us-tunnel {start|ensure|stop|restart|status|logs}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

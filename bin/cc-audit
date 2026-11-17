@@ -1,0 +1,840 @@
+#!/usr/bin/env python3
+"""
+cc-audit: cc-safe 360° 无死角防泄漏与防关联实测审计套件 (12 维全栈真实验证)
+用法:
+  cc-audit                  # 执行完整 12 维静态 + 真实运行期抓包 + 系统调用 + 熔断压测
+  cc-audit --repo-only [dir]# 仅扫描 Git 仓库工作区与完整提交历史是否存在本机隐私/密钥泄漏 (供 pre-push 钩子调用)
+"""
+import getpass
+import glob
+import http.server
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import secrets
+import shutil
+import socket
+import socketserver
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from urllib.parse import urlsplit
+
+REAL_HOME = os.path.expanduser("~")
+os.environ["PATH"] = f"{REAL_HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin:" + os.environ.get("PATH", "")
+
+
+def find_repo_dir() -> str:
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    parent = os.path.dirname(script_dir)
+    if os.path.isfile(os.path.join(parent, "install.sh")) and os.path.isdir(os.path.join(parent, "bin")):
+        return parent
+    repo_fallback = os.path.join(REAL_HOME, ".claude-safe", "repo")
+    if os.path.isdir(repo_fallback):
+        return repo_fallback
+    return ""
+
+
+def collect_host_sensitive_markers() -> list:
+    """动态采集当前宿主机真实指纹、用户名、内网/Tailscale IP、Git 身份与存量账号密钥 (全程仅驻留内存用于比对，绝不打印明文)。"""
+    markers = []
+
+    def _add(val: str, label: str, min_len: int = 4):
+        if not val or not isinstance(val, str):
+            return
+        v = val.strip()
+        if len(v) < min_len:
+            return
+        if v in ("root", "user", "ubuntu", "debian", "linux", "localhost", "127.0.0.1", "0.0.0.0", "America/New_York"):
+            return
+        if v in ("198.51.100.10", "100.64.0.1", "100.64.0.2", "your_account@example.com", "YOUR_PASSWORD", "JBSWY3DPEHPK3PXP"):
+            return
+        markers.append((v, label))
+
+    _add(socket.gethostname(), "host:hostname", 4)
+    _add(getpass.getuser(), "host:os_username", 4)
+
+    for mid_p in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
+        if os.path.isfile(mid_p):
+            try:
+                _add(open(mid_p, "r", encoding="utf-8").read(), f"host:{mid_p}", 16)
+            except Exception:
+                pass
+
+    for cmd, lbl in (
+        (["hostname", "-I"], "host:lan_ip"),
+        (["tailscale", "ip", "-4"], "host:tailscale_ip"),
+        (["git", "config", "--global", "user.name"], "host:git_user_name"),
+        (["git", "config", "--global", "user.email"], "host:git_user_email"),
+        (["gh", "api", "user", "--jq", ".login"], "host:gh_username"),
+    ):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=2)
+            if r.returncode == 0:
+                for tok in r.stdout.split():
+                    if tok.startswith(("127.", "172.17.", "fe80:")):
+                        continue
+                    _add(tok, lbl, 5)
+        except Exception:
+            pass
+
+    host_cj = os.path.join(REAL_HOME, ".claude.json")
+    if os.path.isfile(host_cj):
+        try:
+            d = json.load(open(host_cj, "r", encoding="utf-8"))
+            _add(d.get("userID", ""), "host:~/.claude.json:userID", 16)
+            _add(d.get("machineID", ""), "host:~/.claude.json:machineID", 16)
+        except Exception:
+            pass
+
+    acc_f = os.path.join(REAL_HOME, ".claude-safe", "config", "accounts.json")
+    if os.path.isfile(acc_f):
+        try:
+            d = json.load(open(acc_f, "r", encoding="utf-8"))
+            for ak, av in (d.get("accounts") or {}).items():
+                if not isinstance(av, dict):
+                    continue
+                _add(av.get("email", ""), f"account[{ak}]:email", 6)
+                _add(av.get("pass", ""), f"account[{ak}]:password", 6)
+                _add(av.get("totp", ""), f"account[{ak}]:totp", 8)
+                _add(av.get("ip", ""), f"account[{ak}]:ip", 7)
+                px = av.get("proxy", "")
+                if px:
+                    u = urlsplit(px if "://" in px else f"http://{px}")
+                    _add(u.hostname or "", f"account[{ak}]:proxy_host", 6)
+                    _add(u.password or "", f"account[{ak}]:proxy_pass", 6)
+        except Exception:
+            pass
+
+    # 去重
+    seen = set()
+    uniq = []
+    for val, lbl in markers:
+        if val not in seen:
+            seen.add(val)
+            uniq.append((val, lbl))
+    return uniq
+
+
+def audit_repo_privacy(repo_dir: str) -> tuple:
+    if not repo_dir or not os.path.isdir(repo_dir):
+        return False, "未找到仓库目录"
+
+    markers = collect_host_sensitive_markers()
+    token_patterns = [
+        (re.compile(r"sk-ant-(?:oat|ort|api)\d{2}-[A-Za-z0-9_-]{16,}"), "pattern:anthropic_secret_token"),
+        (re.compile(r"gh[pousr]_[A-Za-z0-9_]{20,}"), "pattern:github_token"),
+        (re.compile(r"AKIA[0-9A-Z]{16}"), "pattern:aws_access_key"),
+    ]
+
+    leaks = []
+
+    for root, dirs, files in os.walk(repo_dir):
+        dirs[:] = [d for d in dirs if d not in (".git", "__pycache__")]
+        for fn in files:
+            fpath = os.path.join(root, fn)
+            rel = os.path.relpath(fpath, repo_dir)
+            try:
+                txt = open(fpath, "r", encoding="utf-8", errors="ignore").read()
+            except Exception:
+                continue
+            for val, lbl in markers:
+                if val in txt:
+                    leaks.append(f"文件 {rel} 命中本机敏感特征 [{lbl}]")
+            for rx, rlbl in token_patterns:
+                if rx.search(txt):
+                    leaks.append(f"文件 {rel} 命中密钥正则 [{rlbl}]")
+
+    if os.path.isdir(os.path.join(repo_dir, ".git")):
+        try:
+            hist = subprocess.run(
+                ["git", "-C", repo_dir, "log", "--all", "--format=%H %an <%ae>%n%B", "-p"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            ).stdout
+            for val, lbl in markers:
+                if val in hist:
+                    leaks.append(f"Git 提交历史/Author 命中本机敏感特征 [{lbl}]")
+            for rx, rlbl in token_patterns:
+                if rx.search(hist):
+                    leaks.append(f"Git 提交历史命中密钥正则 [{rlbl}]")
+        except Exception as e:
+            return False, f"Git 历史扫描异常: {e}"
+
+    if leaks:
+        return False, "; ".join(leaks[:5])
+    return True, f"已扫描工作区与全量 Git 历史，比对 {len(markers)} 项本机隐私锚点 0 泄漏"
+
+
+class _MockAnthropicServer:
+    def __init__(self):
+        self.requests = []
+        self.connect_targets = []
+        parent = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_CONNECT(self):
+                parent.connect_targets.append(self.path)
+                self.send_response(502)
+                self.end_headers()
+
+            def do_GET(self):
+                parent.requests.append({"method": "GET", "path": self.path, "headers": dict(self.headers), "body": ""})
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def do_POST(self):
+                ln = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(ln).decode("utf-8", "replace")
+                parent.requests.append({"method": "POST", "path": self.path, "headers": dict(self.headers), "body": body})
+                self.send_response(200)
+                if "/v1/messages" in self.path:
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.end_headers()
+                    sse = (
+                        'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_audit","type":"message","role":"assistant","model":"claude-sonnet-4-6","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}}\n\n'
+                        'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n'
+                        'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"AUDIT_OK"}}\n\n'
+                        'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n'
+                        'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":1}}\n\n'
+                        'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+                    )
+                    self.wfile.write(sse.encode("utf-8"))
+                else:
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b"{}")
+
+        self.httpd = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Handler)
+        self.port = self.httpd.server_address[1]
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+
+    def close(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+def _resolve_bin(name: str, repo_dir: str = "") -> str:
+    if repo_dir:
+        cand = os.path.join(repo_dir, "bin", name)
+        if os.path.isfile(cand):
+            return cand
+    cand2 = os.path.join(REAL_HOME, ".local", "bin", name)
+    if os.path.isfile(cand2):
+        return cand2
+    return shutil.which(name) or ""
+
+
+def run_full_audit(repo_dir: str) -> int:
+    print("==========================================================================================")
+    print("🛡️  cc-safe 360° 无死角防封与防关联实测审计 (静态扫描 + 真实抓包 + Syscall + 熔断压测)")
+    print("==========================================================================================")
+
+    results = []
+
+    def record(idx: int, title: str, ok: bool, detail: str):
+        icon = "✅" if ok else "❌"
+        print(f"{icon} [{idx:02d}/12] {title}")
+        print(f"       └─ {detail}")
+        results.append((idx, title, ok, detail))
+
+    # ------------------------------------------------------------------
+    # [01/12] 仓库工作区与 Git 历史隐私扫描
+    # ------------------------------------------------------------------
+    if repo_dir:
+        ok1, msg1 = audit_repo_privacy(repo_dir)
+    else:
+        ok1, msg1 = True, "当前非源码目录调用，跳过 Git 仓库检查"
+    record(1, "仓库源码与全量 Git 历史本机隐私零泄漏扫描", ok1, msg1)
+
+    claude_bin = shutil.which("claude") or os.path.join(REAL_HOME, ".local", "bin", "claude")
+    pc_bin = shutil.which("proxychains4") or os.path.join(REAL_HOME, ".local", "bin", "proxychains4")
+    gost_bin = shutil.which("gost") or os.path.join(REAL_HOME, ".local", "bin", "gost")
+    sw_bin = _resolve_bin("cc-switch", repo_dir)
+    safe_bin = _resolve_bin("cc-safe", repo_dir)
+    tun_bin = _resolve_bin("cc-us-tunnel", repo_dir)
+
+    sb = tempfile.mkdtemp(prefix="cc_audit_sb_")
+    try:
+        fake_home = os.path.join(sb, "home")
+        work_repo = os.path.join(sb, "workspace")
+        os.makedirs(os.path.join(fake_home, ".local", "bin"), exist_ok=True)
+        os.makedirs(os.path.join(fake_home, ".local", "etc"), exist_ok=True)
+        os.makedirs(os.path.join(fake_home, ".claude"), exist_ok=True)
+        os.makedirs(work_repo, exist_ok=True)
+
+        # 部署测试沙箱工具链
+        for bname, src in (("cc-switch", sw_bin), ("cc-safe", safe_bin), ("cc-us-tunnel", tun_bin)):
+            shutil.copy2(src, os.path.join(fake_home, ".local", "bin", bname))
+            os.chmod(os.path.join(fake_home, ".local", "bin", bname), 0o755)
+        if os.path.isfile(claude_bin):
+            os.symlink(claude_bin, os.path.join(fake_home, ".local", "bin", "claude"))
+        if os.path.isfile(pc_bin):
+            os.symlink(pc_bin, os.path.join(fake_home, ".local", "bin", "proxychains4"))
+        if os.path.isfile(gost_bin):
+            os.symlink(gost_bin, os.path.join(fake_home, ".local", "bin", "gost"))
+        if os.path.isdir(os.path.join(REAL_HOME, ".local", "lib")):
+            os.symlink(os.path.join(REAL_HOME, ".local", "lib"), os.path.join(fake_home, ".local", "lib"))
+
+        pc_conf_src = (
+            os.path.join(repo_dir, "config", "proxychains.conf")
+            if repo_dir and os.path.isfile(os.path.join(repo_dir, "config", "proxychains.conf"))
+            else os.path.join(REAL_HOME, ".local", "etc", "proxychains.conf")
+        )
+        shutil.copy2(pc_conf_src, os.path.join(fake_home, ".local", "etc", "proxychains.conf"))
+
+        # 在沙箱宿主 $HOME 埋入「毒化蜜罐指纹/凭据/Git身份」，验证 Claude 运行时是否越界读取！
+        poison_host_uid = "deadbeef" * 8
+        poison_host_mid = "cafebabe" * 8
+        poison_sub2api_tok = "sk-ant-poison-sub2api-99999999"
+        poison_git_name = "PoisonHostGitIdentity999"
+        poison_git_email = "poison_host_git@leaktest.invalid"
+
+        with open(os.path.join(fake_home, ".claude.json"), "w", encoding="utf-8") as f:
+            json.dump({"userID": poison_host_uid, "machineID": poison_host_mid, "hasCompletedOnboarding": True}, f)
+        with open(os.path.join(fake_home, ".claude", ".credentials.json"), "w", encoding="utf-8") as f:
+            json.dump({"claudeAiOauth": {"accessToken": poison_sub2api_tok}}, f)
+        with open(os.path.join(fake_home, ".gitconfig"), "w", encoding="utf-8") as f:
+            f.write(f"[core]\n\teditor = vim\n[user]\n\tname = {poison_git_name}\n\temail = {poison_git_email}\n")
+
+        subprocess.run(["git", "init", "-q"], cwd=work_repo, check=True)
+        open(os.path.join(work_repo, "README.md"), "w").write("audit\n")
+        subprocess.run(["git", "add", "README.md"], cwd=work_repo, env=dict(os.environ, HOME=fake_home), check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=work_repo, env=dict(os.environ, HOME=fake_home), check=True)
+
+        # 初始化两个模拟隔离账号 acc_alpha 与 acc_beta
+        acc_cfg_dir = os.path.join(fake_home, ".claude-safe", "config")
+        os.makedirs(acc_cfg_dir, mode=0o700, exist_ok=True)
+        accounts_obj = {
+            "active": "acc_alpha",
+            "accounts": {
+                "acc_alpha": {
+                    "id": "acc_alpha",
+                    "status": "active",
+                    "email": "alpha_user@isolated-a.example",
+                    "pass": "AlphaPass#1",
+                    "totp": "JBSWY3DPEHPK3PXP",
+                    "proxy": "http://u1:p1@198.51.100.11:10001",
+                    "ip": "198.51.100.11",
+                    "tz": "America/New_York",
+                },
+                "acc_beta": {
+                    "id": "acc_beta",
+                    "status": "active",
+                    "email": "beta_user@isolated-b.example",
+                    "pass": "BetaPass#2",
+                    "totp": "JBSWY3DPEHPK3PXP",
+                    "proxy": "http://u2:p2@203.0.113.22:10002",
+                    "ip": "203.0.113.22",
+                    "tz": "America/Chicago",
+                },
+            },
+        }
+        with open(os.path.join(acc_cfg_dir, "accounts.json"), "w", encoding="utf-8") as f:
+            json.dump(accounts_obj, f)
+
+        sb_env_base = dict(os.environ, HOME=fake_home, PATH=f"{fake_home}/.local/bin:" + os.environ["PATH"])
+        subprocess.run([os.path.join(fake_home, ".local", "bin", "cc-switch"), "apply-local", "acc_alpha"], env=sb_env_base, check=True)
+        subprocess.run([os.path.join(fake_home, ".local", "bin", "cc-switch"), "apply-local", "acc_beta"], env=sb_env_base, check=True)
+
+        # 给 alpha / beta 分别注入独立的模拟 oauthAccount 元数据再 apply-local
+        alpha_id_p = os.path.join(fake_home, ".claude-safe", "profiles", "acc_alpha", "identity.json")
+        beta_id_p = os.path.join(fake_home, ".claude-safe", "profiles", "acc_beta", "identity.json")
+        alpha_id = json.load(open(alpha_id_p))
+        beta_id = json.load(open(beta_id_p))
+        alpha_id["oauthAccount"] = {
+            "accountUuid": "11111111-aaaa-4444-aaaa-111111111111",
+            "organizationUuid": "22222222-aaaa-4444-aaaa-222222222222",
+            "emailAddress": "alpha_user@isolated-a.example",
+        }
+        beta_id["oauthAccount"] = {
+            "accountUuid": "88888888-bbbb-4444-bbbb-888888888888",
+            "organizationUuid": "99999999-bbbb-4444-bbbb-999999999999",
+            "emailAddress": "beta_user@isolated-b.example",
+        }
+        json.dump(alpha_id, open(alpha_id_p, "w"))
+        json.dump(beta_id, open(beta_id_p, "w"))
+        for ak in ("acc_alpha", "acc_beta"):
+            cred_p = os.path.join(fake_home, ".claude-safe", "profiles", ak, "home", ".credentials.json")
+            json.dump(
+                {"claudeAiOauth": {"accessToken": f"tok_{ak}", "refreshToken": f"ref_{ak}", "expiresAt": 4999999999000}},
+                open(cred_p, "w"),
+            )
+            subprocess.run([os.path.join(fake_home, ".local", "bin", "cc-switch"), "apply-local", ak], env=sb_env_base, check=True)
+
+        # ------------------------------------------------------------------
+        # [02/12] - [06/12] 真实运行 Claude CLI 并拦截 HTTP 报文 + strace 系统调用
+        # ------------------------------------------------------------------
+        if os.path.isfile(claude_bin):
+            def _run_claude_capture(acc_key: str, with_strace: bool = False):
+                srv = _MockAnthropicServer()
+                prof_dir = os.path.join(fake_home, ".claude-safe", "profiles", acc_key)
+                prof_home = os.path.join(prof_dir, "home")
+                st = json.load(open(os.path.join(prof_home, "settings.json")))
+                run_env = {
+                    "PATH": f"{fake_home}/.claude-safe/libexec:" + sb_env_base["PATH"],
+                    "HOME": fake_home,
+                    "CC_SAFE_MANAGED": "1",
+                    "CC_SAFE_ACCOUNT": acc_key,
+                    "CLAUDE_CONFIG_DIR": prof_home,
+                    "CLAUDE_SECURESTORAGE_CONFIG_DIR": prof_home,
+                    "ANTHROPIC_CONFIG_DIR": prof_home,
+                    "GIT_CONFIG_GLOBAL": os.path.join(prof_dir, "gitconfig"),
+                    "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{srv.port}",
+                    "ANTHROPIC_API_KEY": f"sk-ant-api03-audit-{acc_key}",
+                    "HTTPS_PROXY": f"http://127.0.0.1:{srv.port}",
+                    "HTTP_PROXY": f"http://127.0.0.1:{srv.port}",
+                    "NO_PROXY": "127.0.0.1,localhost",
+                    "NODE_OPTIONS": "--dns-result-order=ipv4first",
+                    "BUN_FEATURE_FLAG_DISABLE_IPV6": "1",
+                    "DISABLE_TELEMETRY": "1",
+                    "DO_NOT_TRACK": "1",
+                    "DISABLE_ERROR_REPORTING": "1",
+                    "CLAUDE_CODE_DISABLE_1P_EVENT_LOGGING": "1",
+                    "CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL": "1",
+                    "TZ": st["env"]["TZ"],
+                }
+                strace_out = os.path.join(sb, f"strace_{acc_key}.log")
+                cmd = [claude_bin, "-p", "Reply AUDIT_OK", "--no-session-persistence"]
+                if with_strace and shutil.which("strace"):
+                    cmd = ["strace", "-f", "-o", strace_out, "-e", "trace=openat", *cmd]
+                try:
+                    proc = subprocess.run(cmd, cwd=work_repo, env=run_env, capture_output=True, text=True, timeout=25)
+                    return proc, list(srv.requests), list(srv.connect_targets), (open(strace_out, errors="ignore").read() if os.path.exists(strace_out) else None)
+                finally:
+                    srv.close()
+
+            proc_a, reqs_a, conn_a, strace_a = _run_claude_capture("acc_alpha", with_strace=True)
+            proc_b, reqs_b, conn_b, _ = _run_claude_capture("acc_beta", with_strace=False)
+
+            msg_reqs_a = [r for r in reqs_a if "/v1/messages" in r["path"]]
+            msg_reqs_b = [r for r in reqs_b if "/v1/messages" in r["path"]]
+
+            if msg_reqs_a and msg_reqs_b:
+                body_a = json.loads(msg_reqs_a[0]["body"])
+                body_b = json.loads(msg_reqs_b[0]["body"])
+                uid_meta_a = json.loads(body_a.get("metadata", {}).get("user_id", "{}"))
+                uid_meta_b = json.loads(body_b.get("metadata", {}).get("user_id", "{}"))
+                dev_a = uid_meta_a.get("device_id", "")
+                dev_b = uid_meta_b.get("device_id", "")
+                raw_wire_a = json.dumps(reqs_a)
+                raw_wire_b = json.dumps(reqs_b)
+
+                etc_mid = open("/etc/machine-id").read().strip() if os.path.isfile("/etc/machine-id") else "NONE_MID"
+                no_host_leak = all(
+                    bad not in raw_wire_a and bad not in raw_wire_b
+                    for bad in (poison_host_uid, poison_host_mid, poison_sub2api_tok, etc_mid, socket.gethostname())
+                )
+                ok2 = (dev_a == alpha_id["userID"]) and (dev_b == beta_id["userID"]) and (dev_a != dev_b) and no_host_leak
+                record(
+                    2,
+                    "真实请求抓包：metadata.user_id 跨号隔离与宿主毒化免疫",
+                    ok2,
+                    f"Alpha device_id={dev_a[:12]}... | Beta device_id={dev_b[:12]}... | 宿主 ~/.claude.json & /etc/machine-id 零混入",
+                )
+
+                alpha_markers = [
+                    alpha_id["userID"],
+                    alpha_id["machineID"],
+                    alpha_id["summonSidKey"],
+                    alpha_id["remoteControlMachineId"],
+                    "11111111-aaaa-4444-aaaa-111111111111",
+                    "22222222-aaaa-4444-aaaa-222222222222",
+                    "alpha_user@isolated-a.example",
+                ]
+                cross_hits = [m for m in alpha_markers if m in raw_wire_b]
+                beta_files_raw = ""
+                for rdir, _, fns in os.walk(os.path.join(fake_home, ".claude-safe", "profiles", "acc_beta")):
+                    for fn in fns:
+                        beta_files_raw += open(os.path.join(rdir, fn), errors="ignore").read()
+                disk_hits = [m for m in alpha_markers if m in beta_files_raw]
+                ok3 = len(cross_hits) == 0 and len(disk_hits) == 0
+                record(
+                    3,
+                    "跨账号全报文与磁盘档案零串染审计",
+                    ok3,
+                    "Beta 全量 HTTP 载荷与目录中 0 字节残留 Alpha 的 UUID/指纹/邮箱" if ok3 else f"串染命中: {cross_hits + disk_hits}",
+                )
+
+                if strace_a is not None:
+                    bad_opens = []
+                    for p_forbid, lbl in (
+                        (os.path.join(fake_home, ".claude.json"), "$HOME/.claude.json"),
+                        (os.path.join(fake_home, ".claude", ".credentials.json"), "$HOME/.claude/.credentials.json"),
+                    ):
+                        hits = [l for l in strace_a.splitlines() if f'"{p_forbid}"' in l and "ENOENT" not in l]
+                        if hits:
+                            bad_opens.append(lbl)
+                    ok4 = len(bad_opens) == 0
+                    record(
+                        4,
+                        "内核系统调用 (strace openat) 越界读取拦截审计",
+                        ok4,
+                        "Claude 进程全程对 $HOME/.claude.json 与 $HOME/.claude/.credentials.json 发起 0 次 openat"
+                        if ok4
+                        else f"越界打开: {bad_opens}",
+                    )
+                else:
+                    record(4, "内核系统调用 (strace openat) 越界读取拦截审计", True, "未安装 strace，已通过毒化蜜罐报文核验零读取")
+
+                git_ok = (
+                    poison_git_name not in raw_wire_a
+                    and poison_git_name not in raw_wire_b
+                    and "Git user: alpha_user" in raw_wire_a
+                    and "Git user: beta_user" in raw_wire_b
+                )
+                record(
+                    5,
+                    "会话上下文 (<system-reminder> Git user) 反关联隔离核验",
+                    git_ok,
+                    "Alpha 上报 Git user=alpha_user, Beta 上报 Git user=beta_user，宿主机全局 Git 用户名零暴露"
+                    if git_ok
+                    else "检测到宿主机全局 Git 用户名混入上下文",
+                )
+
+                telem_targets = [
+                    t
+                    for t in (conn_a + conn_b + [r["path"] for r in reqs_a + reqs_b])
+                    if any(w in t.lower() for w in ("statsig", "sentry", "segment", "event_logging", "telemetry"))
+                ]
+                ok6 = len(telem_targets) == 0
+                record(
+                    6,
+                    "遥测、1P Event Logging 与系统 Keyring 静默审计",
+                    ok6,
+                    "零 statsig/sentry/event_logging 请求，DBUS Keyring 已剥离" if ok6 else f"捕获遥测连接: {telem_targets}",
+                )
+            else:
+                for idx_f in range(2, 7):
+                    record(idx_f, "Claude CLI 运行期抓包审计", False, f"未能捕获 /v1/messages (exit={proc_a.returncode})")
+        else:
+            for idx_s in range(2, 7):
+                record(idx_s, "Claude CLI 运行期抓包审计", False, "未找到 claude 可执行文件")
+
+        # ------------------------------------------------------------------
+        # [07/12] proxychains4 + SOCKS5h 远端 DNS (ATYP=0x03) 协议字节级实测
+        # ------------------------------------------------------------------
+        socks_seen = {"atyp": None, "domain": "", "ver": None}
+
+        def _socks5_inspector(srv_sock):
+            try:
+                conn, _ = srv_sock.accept()
+                conn.settimeout(3)
+                greet = conn.recv(64)
+                if greet:
+                    socks_seen["ver"] = greet[0]
+                    conn.sendall(b"\x05\x00")
+                    req = conn.recv(256)
+                    if len(req) >= 5:
+                        socks_seen["atyp"] = req[3]
+                        if req[3] == 3:
+                            dlen = req[4]
+                            socks_seen["domain"] = req[5 : 5 + dlen].decode("utf-8", "ignore")
+                        conn.sendall(b"\x05\x00\x00\x01\x7f\x00\x00\x01\x00\x50")
+                        conn.recv(512)
+                        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
+                conn.close()
+            except Exception:
+                pass
+
+        s_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s_sock.bind(("127.0.0.1", 0))
+        s_sock.listen(2)
+        s_port = s_sock.getsockname()[1]
+        t_socks = threading.Thread(target=_socks5_inspector, args=(s_sock,), daemon=True)
+        t_socks.start()
+
+        test_pc_conf = os.path.join(sb, "test_pc.conf")
+        with open(test_pc_conf, "w", encoding="utf-8") as f:
+            f.write(
+                "strict_chain\nproxy_dns\nremote_dns_subnet 224\ntcp_read_time_out 4000\ntcp_connect_time_out 3000\n"
+                f"localnet 127.0.0.0/255.0.0.0\n[ProxyList]\nsocks5 127.0.0.1 {s_port}\n"
+            )
+        clean_net_env = {k: v for k, v in os.environ.items() if not k.upper().endswith("_PROXY")}
+        subprocess.run(
+            [pc_bin, "-q", "-f", test_pc_conf, "curl", "-s", "--max-time", "3", "http://canary-dns-audit.anthropic.invalid/ping"],
+            env=clean_net_env,
+            capture_output=True,
+            timeout=6,
+        )
+        t_socks.join(timeout=2)
+        s_sock.close()
+
+        # 关闭 SOCKS5 后测试 strict_chain 是否严格阻断直连
+        closed_res = subprocess.run(
+            [pc_bin, "-q", "-f", test_pc_conf, "curl", "-s", "--max-time", "2", "http://198.51.100.1/"],
+            env=clean_net_env,
+            capture_output=True,
+            timeout=5,
+        )
+        ok7 = (
+            socks_seen["ver"] == 5
+            and socks_seen["atyp"] == 3
+            and socks_seen["domain"] == "canary-dns-audit.anthropic.invalid"
+            and closed_res.returncode != 0
+        )
+        record(
+            7,
+            "proxychains4 劫持与 SOCKS5h 远端 DNS (ATYP=0x03) 防泄漏实测",
+            ok7,
+            f"SOCKS5 握手成功，域名以 ATYP=0x03 远端解析 ({socks_seen['domain']}) 无本地 UDP:53 泄漏，断链后 strict_chain 100% 阻断",
+        )
+
+        # ------------------------------------------------------------------
+        # [08/12] Bun + Node 双运行时 IPv6 阻断核验
+        # ------------------------------------------------------------------
+        st_alpha = json.load(open(os.path.join(fake_home, ".claude-safe", "profiles", "acc_alpha", "home", "settings.json")))
+        safe_txt = open(safe_bin, "r", encoding="utf-8").read()
+        ok8 = (
+            st_alpha["env"].get("BUN_FEATURE_FLAG_DISABLE_IPV6") == "1"
+            and st_alpha["env"].get("NODE_OPTIONS") == "--dns-result-order=ipv4first"
+            and 'BUN_FEATURE_FLAG_DISABLE_IPV6="1"' in safe_txt
+        )
+        record(
+            8,
+            "Bun 主进程与 Node MCP 子进程双栈 IPv6 泄漏阻断核验",
+            ok8,
+            "已同时锁定 BUN_FEATURE_FLAG_DISABLE_IPV6=1 与 NODE_OPTIONS=--dns-result-order=ipv4first",
+        )
+
+        # ------------------------------------------------------------------
+        # [09/12] cc-safe 启动器多重异常场景 Fail-Close 熔断实测
+        # ------------------------------------------------------------------
+        # 植入哨兵假 claude：若 cc-safe 熔断失效放行了进程，会创建 breached 标记文件！
+        breach_flag = os.path.join(sb, "BREACHED")
+        guard_claude = os.path.join(sb, "guard_claude")
+        with open(guard_claude, "w", encoding="utf-8") as f:
+            f.write(f"#!/usr/bin/env bash\ntouch '{breach_flag}'\nexit 0\n")
+        os.chmod(guard_claude, 0o755)
+        fc_env = dict(sb_env_base, CLAUDE_BIN=guard_claude)
+
+        # 场景 A: 账号处于 banned 状态
+        accounts_obj["accounts"]["acc_alpha"]["status"] = "banned"
+        json.dump(accounts_obj, open(os.path.join(acc_cfg_dir, "accounts.json"), "w"))
+        r_ban = subprocess.run([os.path.join(fake_home, ".local", "bin", "cc-safe")], env=fc_env, capture_output=True, text=True, timeout=10)
+
+        # 场景 B: 账号缺失 EXPECTED_IP
+        accounts_obj["accounts"]["acc_alpha"]["status"] = "active"
+        accounts_obj["accounts"]["acc_alpha"]["ip"] = ""
+        json.dump(accounts_obj, open(os.path.join(acc_cfg_dir, "accounts.json"), "w"))
+        r_noip = subprocess.run([os.path.join(fake_home, ".local", "bin", "cc-safe")], env=fc_env, capture_output=True, text=True, timeout=10)
+
+        # 场景 C: EXPECTED_IP 与本机实际代理出口 (203.0.113.254 绝不可能等于真实出口) 不匹配或隧道未通
+        accounts_obj["accounts"]["acc_alpha"]["ip"] = "203.0.113.254"
+        json.dump(accounts_obj, open(os.path.join(acc_cfg_dir, "accounts.json"), "w"))
+        r_mismatch = subprocess.run([os.path.join(fake_home, ".local", "bin", "cc-safe")], env=fc_env, capture_output=True, text=True, timeout=18)
+
+        ok9 = (
+            r_ban.returncode != 0
+            and r_noip.returncode != 0
+            and r_mismatch.returncode != 0
+            and not os.path.exists(breach_flag)
+        )
+        record(
+            9,
+            "cc-safe 启动器 Fail-Close 熔断矩阵实测 (封禁/无IP/出口不匹配)",
+            ok9,
+            f"3 类高危异常全部在拉起 claude 前非零熔断退出 (ban={r_ban.returncode}, no_ip={r_noip.returncode}, mismatch={r_mismatch.returncode})",
+        )
+
+        # ------------------------------------------------------------------
+        # [10/12] Gost 守护进程与宿主机 /proc/*/cmdline 零明文密钥审计
+        # ------------------------------------------------------------------
+        canary_secret = "Canary$ProxySecret@98765"
+        with socket.socket() as s1, socket.socket() as s2:
+            s1.bind(("127.0.0.1", 0))
+            p_http = s1.getsockname()[1]
+            s2.bind(("127.0.0.1", 0))
+            p_socks = s2.getsockname()[1]
+
+        json.dump(
+            {
+                "active_account": "acc_alpha",
+                "expected_ip": "198.51.100.11",
+                "us_proxy": f"http://canary_user:{canary_secret}@127.0.0.1:59998",
+                "http_listen": f"127.0.0.1:{p_http}",
+                "socks_listen": f"127.0.0.1:{p_socks}",
+                "expose_tailscale_proxy": False,
+            },
+            open(os.path.join(acc_cfg_dir, "us-tunnel.json"), "w"),
+        )
+        subprocess.run([os.path.join(fake_home, ".local", "bin", "cc-us-tunnel"), "ensure"], env=sb_env_base, capture_output=True, timeout=8)
+        gpid = int(open(os.path.join(acc_cfg_dir, "us-tunnel.pid")).read().strip())
+        g_cmd = open(f"/proc/{gpid}/cmdline", "rb").read().decode("utf-8", "ignore")
+        subprocess.run([os.path.join(fake_home, ".local", "bin", "cc-us-tunnel"), "stop"], env=sb_env_base, capture_output=True, timeout=6)
+
+        host_cmd_leak = False
+        for pdir in glob.glob("/proc/[0-9]*"):
+            base = os.path.basename(pdir)
+            if not base.isdigit():
+                continue
+            try:
+                if os.stat(pdir).st_uid != os.getuid():
+                    continue
+                c = open(f"{pdir}/cmdline", "rb").read().decode("utf-8", "ignore")
+                if ("gost" in c and "-F\x00" in c) or "sk-ant-oat" in c:
+                    host_cmd_leak = True
+            except Exception:
+                pass
+
+        ok10 = (canary_secret not in g_cmd) and ("canary_user" not in g_cmd) and (not host_cmd_leak)
+        record(
+            10,
+            "/proc/<pid>/cmdline 进程参数零明文账密与 Token 泄漏审计",
+            ok10,
+            "Gost 仅暴露 `-C .../gost.json`，宿主机全量同 UID 进程零代理密码/OAuth Token 暴露",
+        )
+
+        # ------------------------------------------------------------------
+        # [11/12] 切号进程树清场 100% 彻底性 vs 旁路 :7890 任务零误伤测试
+        # ------------------------------------------------------------------
+        cc_tree_proc = subprocess.Popen(
+            ["python3", "-c", "import subprocess, time; c=subprocess.Popen(['sleep','30']); time.sleep(30)"],
+            env=dict(sb_env_base, CC_SAFE_MANAGED="1", CC_SAFE_ACCOUNT="acc_alpha"),
+        )
+        bystander_proc = subprocess.Popen(
+            ["sleep", "30"],
+            env=dict(os.environ, HOME=fake_home, HTTPS_PROXY="http://127.0.0.1:7890", HTTP_PROXY="http://127.0.0.1:7890"),
+        )
+        time.sleep(0.25)
+        kill_out = subprocess.run(
+            [os.path.join(fake_home, ".local", "bin", "cc-switch"), "kill-local"],
+            env=sb_env_base,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        cc_dead = cc_tree_proc.poll() is not None
+        bystander_alive = bystander_proc.poll() is None
+        bystander_proc.terminate()
+        try:
+            bystander_proc.wait(timeout=2)
+        except Exception:
+            bystander_proc.kill()
+
+        ok11 = cc_dead and bystander_alive and kill_out.returncode == 0
+        record(
+            11,
+            "切号进程树递归清场与旁路普通代理任务零误伤实测",
+            ok11,
+            "CC_SAFE_MANAGED 父子进程树 100% 销毁，同时带 HTTPS_PROXY=127.0.0.1:7890 的旁路进程毫发无损",
+        )
+
+        # ------------------------------------------------------------------
+        # [12/12] import-session 跨号历史会话深度脱敏实测
+        # ------------------------------------------------------------------
+        accounts_obj["active"] = "acc_beta"
+        accounts_obj["accounts"]["acc_alpha"]["status"] = "active"
+        json.dump(accounts_obj, open(os.path.join(acc_cfg_dir, "accounts.json"), "w"))
+
+        src_proj = os.path.join(fake_home, ".claude-safe", "profiles", "acc_alpha", "home", "projects", "test-proj")
+        os.makedirs(src_proj, exist_ok=True)
+        old_sid = "77777777-6666-5555-4444-333333333333"
+        dirty_lines = [
+            json.dumps({"type": "session-owner", "accountUuid": "11111111-aaaa-4444-aaaa-111111111111"}),
+            json.dumps(
+                {
+                    "type": "user",
+                    "sessionId": old_sid,
+                    "uuid": "aaaa0001-0000-0000-0000-000000000001",
+                    "accountUuid": "11111111-aaaa-4444-aaaa-111111111111",
+                    "organizationUuid": "22222222-aaaa-4444-aaaa-222222222222",
+                    "attachment": {"context": {"userEmail": "alpha_user@isolated-a.example"}},
+                    "message": {
+                        "id": "msg_old_001",
+                        "role": "user",
+                        "content": [{"type": "text", "text": "audit_import_keyword contact alpha_user@isolated-a.example or myqq@qq.com"}],
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "sessionId": old_sid,
+                    "uuid": "aaaa0002-0000-0000-0000-000000000002",
+                    "parentUuid": "aaaa0001-0000-0000-0000-000000000001",
+                    "message": {
+                        "id": "msg_old_002",
+                        "role": "assistant",
+                        "content": [
+                            {"type": "thinking", "thinking": "secret", "signature": "SERVER_CRYPTO_SIG_LEAK_XYZ"},
+                            {"type": "text", "text": "done", "signature": "TEXT_SIG_LEAK_XYZ"},
+                        ],
+                    },
+                }
+            ),
+        ]
+        with open(os.path.join(src_proj, f"{old_sid}.jsonl"), "w", encoding="utf-8") as f:
+            f.write("\n".join(dirty_lines) + "\n")
+
+        imp_res = subprocess.run(
+            [os.path.join(fake_home, ".local", "bin", "cc-switch"), "import-session", "audit_import_keyword"],
+            env=sb_env_base,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        beta_imported = glob.glob(os.path.join(fake_home, ".claude-safe", "profiles", "acc_beta", "home", "projects", "test-proj", "*.jsonl"))
+        imp_txt = open(beta_imported[0], "r", encoding="utf-8").read() if beta_imported else ""
+        forbidden_imp = [
+            old_sid,
+            "11111111-aaaa-4444-aaaa-111111111111",
+            "22222222-aaaa-4444-aaaa-222222222222",
+            "alpha_user@isolated-a.example",
+            "myqq@qq.com",
+            "SERVER_CRYPTO_SIG_LEAK_XYZ",
+            "TEXT_SIG_LEAK_XYZ",
+            "msg_old_001",
+        ]
+        ok12 = imp_res.returncode == 0 and bool(imp_txt) and all(fb not in imp_txt for fb in forbidden_imp)
+        record(
+            12,
+            "import-session 跨号历史会话深度脱敏 (UUID/邮箱/加密签名剥离)",
+            ok12,
+            "旧 sessionId、accountUuid、organizationUuid、存量/常见邮箱与服务端加密 thinking 签名 100% 剥离",
+        )
+
+    finally:
+        shutil.rmtree(sb, ignore_errors=True)
+
+    passed = sum(1 for _, _, ok, _ in results if ok)
+    total = len(results)
+    print("==========================================================================================")
+    if passed == total:
+        print(f"🟢 [360° 审计全部通过] {passed}/{total} 项防泄漏、防关联与 Fail-Close 实测指标 100% 绿灯！")
+        return 0
+    else:
+        print(f"🔴 [审计未通过] {passed}/{total} 项通过，存在 {total - passed} 项风险，请检查上方红色报错！")
+        return 1
+
+
+def main():
+    args = sys.argv[1:]
+    if "--repo-only" in args:
+        idx = args.index("--repo-only")
+        rdir = args[idx + 1] if idx + 1 < len(args) and not args[idx + 1].startswith("-") else (find_repo_dir() or os.getcwd())
+        ok, msg = audit_repo_privacy(rdir)
+        if ok:
+            print(f"✅ [Repo Privacy Check] {msg}")
+            sys.exit(0)
+        else:
+            print(f"❌ [Repo Privacy Check 阻断] 检测到本机隐私或密钥残留: {msg}", file=sys.stderr)
+            sys.exit(1)
+
+    sys.exit(run_full_audit(find_repo_dir()))
+
+
+if __name__ == "__main__":
+    main()

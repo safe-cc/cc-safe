@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+# cc-safe: Fail-Close Multi-Account Isolation Launcher for Claude Code
+# - Per-account physical CLAUDE_CONFIG_DIR (~/.claude-safe/profiles/<account>/home)
+# - Blocks banned accounts and unconfigured states
+# - Verifies BOTH HTTP (7890) and SOCKS5h (7891) egress match EXPECTED_IP & loc=US
+# - Enforces IPv4-first DNS, remote proxy_dns via proxychains4, and telemetry opt-out
+set -euo pipefail
+
+export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+
+SAFE_DIR="$HOME/.claude-safe"
+ACCOUNTS_FILE="$SAFE_DIR/config/accounts.json"
+
+if [ ! -f "$ACCOUNTS_FILE" ]; then
+    echo "❌ [CC-Guard] 未找到账号配置文件: $ACCOUNTS_FILE" >&2
+    echo "   请先运行: cc-switch add '邮箱----密码----TOTP密钥----sid----host:port:user:pass' [别名]" >&2
+    exit 1
+fi
+
+read_active_meta() {
+    python3 -c '
+import json, os
+p = os.path.expanduser("~/.claude-safe/config/accounts.json")
+d = json.load(open(p, "r", encoding="utf-8"))
+ak = d.get("active", "")
+acc = (d.get("accounts") or {}).get(ak) or {}
+if not ak or not acc:
+    print(json.dumps({"ok": False}))
+else:
+    print(json.dumps({
+        "ok": True,
+        "account": ak,
+        "status": acc.get("status", "active"),
+        "ip": acc.get("ip", ""),
+        "tz": acc.get("tz", "America/New_York"),
+    }))
+'
+}
+
+META_JSON=$(read_active_meta)
+ACTIVE_ACCOUNT=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(d.get("account",""))' "$META_JSON")
+ACC_STATUS=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(d.get("status",""))' "$META_JSON")
+EXPECTED_IP=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(d.get("ip",""))' "$META_JSON")
+TZ_VAL=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(d.get("tz","America/New_York"))' "$META_JSON")
+
+if [ -z "$ACTIVE_ACCOUNT" ]; then
+    echo "❌ [CC-Guard] 当前未激活任何账号！请运行 'cc-switch status' 或 'cc-switch add'。" >&2
+    exit 1
+fi
+
+if [ "$ACC_STATUS" = "banned" ]; then
+    echo "🚫 [CC-Guard 熔断] 当前账号 [$ACTIVE_ACCOUNT] 已标记为封禁 (banned)，严禁启动！" >&2
+    echo "👉 请运行 'cc-switch <可用账号>' 切换，或运行 'cc-switch add' 添加新账号。" >&2
+    exit 1
+fi
+
+if [ -z "$EXPECTED_IP" ] || [ "$EXPECTED_IP" = "未知" ]; then
+    echo "❌ [CC-Guard 熔断] 账号 [$ACTIVE_ACCOUNT] 未绑定明确的静态住宅 EXPECTED_IP，拒绝启动！" >&2
+    exit 1
+fi
+
+# 提前打上受管进程锚点，确保启动窗口期间若发生并发切号能被 100% 识别终止
+export CC_SAFE_MANAGED="1"
+export CC_SAFE_ACCOUNT="$ACTIVE_ACCOUNT"
+
+PROXYCHAINS_BIN="${PROXYCHAINS_BIN:-$(command -v proxychains4 || true)}"
+PROXYCHAINS_CONF="$HOME/.local/etc/proxychains.conf"
+CLAUDE_BIN="${CLAUDE_BIN:-$(command -v claude || true)}"
+
+if [ -z "$PROXYCHAINS_BIN" ] || [ ! -f "$PROXYCHAINS_CONF" ]; then
+    echo "❌ [CC-Guard] 缺少 proxychains4 或 $PROXYCHAINS_CONF，请重新运行 install.sh 修复。" >&2
+    exit 1
+fi
+if [ -z "$CLAUDE_BIN" ]; then
+    echo "❌ [CC-Guard] 未找到 claude 可执行文件，请运行 install.sh 自动安装 Claude Code。" >&2
+    exit 1
+fi
+
+# 2. 确保本地美国家宽隧道已按当前配置拉起 (ensure 模式等待锁完成，避免与 restart 竞态)
+if [ -x "$HOME/.local/bin/cc-us-tunnel" ]; then
+    "$HOME/.local/bin/cc-us-tunnel" ensure >/dev/null 2>&1 || true
+fi
+
+# 3. 双通道 (HTTP 7890 + SOCKS5h 7891) 出口 IP 与地区强制核验
+PROXY_HTTP="http://127.0.0.1:7890"
+PROXY_SOCKS="socks5h://127.0.0.1:7891"
+echo "🔍 [CC-Guard] 正在核验账号 [$ACTIVE_ACCOUNT] 专属隧道 (HTTP+SOCKS5h -> $EXPECTED_IP)..."
+
+TRACE_HTTP=$(curl -s -x "$PROXY_HTTP" --max-time 6 https://api.anthropic.com/cdn-cgi/trace || true)
+HTTP_LOC=$(echo "$TRACE_HTTP" | grep "^loc=" | cut -d= -f2 || true)
+HTTP_IP=$(echo "$TRACE_HTTP" | grep "^ip=" | cut -d= -f2 || true)
+COLO=$(echo "$TRACE_HTTP" | grep "^colo=" | cut -d= -f2 || true)
+
+if [ "$HTTP_LOC" != "US" ] || [ -z "$HTTP_IP" ]; then
+    echo "❌ [严重警告] HTTP 代理链路异常或非美国出口 (LOC=${HTTP_LOC:-超时}, IP=${HTTP_IP:-无})！" >&2
+    echo "🛑 已熔断阻断启动，防止本机真实 IP 暴露。" >&2
+    exit 1
+fi
+
+if [ "$HTTP_IP" != "$EXPECTED_IP" ]; then
+    echo "❌ [严重警告] HTTP 出口 IP ($HTTP_IP) 与账号 [$ACTIVE_ACCOUNT] 绑定 IP ($EXPECTED_IP) 不一致！" >&2
+    echo "🛑 已熔断阻断启动，严防跨号串 IP！请运行 'cc-switch $ACTIVE_ACCOUNT' 修复。" >&2
+    exit 1
+fi
+
+TRACE_SOCKS=$(curl -s -x "$PROXY_SOCKS" --max-time 6 https://api.anthropic.com/cdn-cgi/trace || true)
+SOCKS_IP=$(echo "$TRACE_SOCKS" | grep "^ip=" | cut -d= -f2 || true)
+if [ "$SOCKS_IP" != "$EXPECTED_IP" ]; then
+    echo "❌ [严重警告] SOCKS5h 隧道出口 ($SOCKS_IP) 与绑定 IP ($EXPECTED_IP) 不一致或不可达！" >&2
+    echo "🛑 proxychains4 依赖 127.0.0.1:7891，已熔断阻断启动！" >&2
+    exit 1
+fi
+
+# 4. 锁定当前账号专属物理隔离目录 CLAUDE_CONFIG_DIR
+PROFILE_HOME="$SAFE_DIR/profiles/$ACTIVE_ACCOUNT/home"
+export CLAUDE_CONFIG_DIR="$PROFILE_HOME"
+CRED_PATH="$PROFILE_HOME/.credentials.json"
+
+if [ -x "$HOME/.local/bin/cc-switch" ]; then
+    "$HOME/.local/bin/cc-switch" apply-local "$ACTIVE_ACCOUNT" >/dev/null 2>&1 || true
+    "$HOME/.local/bin/cc-switch" auto-sync >/dev/null 2>&1 || true
+fi
+
+# 二次复核 active 账号未在启动期间被并发切换或封禁
+RECHECK_META=$(read_active_meta)
+RECHECK_ACC=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(d.get("account",""))' "$RECHECK_META")
+RECHECK_ST=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(d.get("status",""))' "$RECHECK_META")
+if [ "$RECHECK_ACC" != "$ACTIVE_ACCOUNT" ] || [ "$RECHECK_ST" = "banned" ]; then
+    echo "🛑 [CC-Guard 熔断] 启动期间检测到账号状态变更 ($ACTIVE_ACCOUNT -> $RECHECK_ACC / $RECHECK_ST)，已中止启动！" >&2
+    exit 1
+fi
+
+rm -rf "$PROFILE_HOME/telemetry" "$PROFILE_HOME/statsig" "$PROFILE_HOME/cache" 2>/dev/null || true
+
+echo "✅ [核验通过] 账号: $ACTIVE_ACCOUNT | 专属目录: ~/.claude-safe/profiles/$ACTIVE_ACCOUNT/home"
+echo "   出口 IP: $HTTP_IP (HTTP & SOCKS5h 双通道一致) | 机房: $COLO | 时区: $TZ_VAL"
+
+# 5. 注入纯净环境变量与进程归属标记 (彻底剥离中转变量、系统 Keyring、IPv6 与遥测)
+unset ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY BROWSER \
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC CLAUDE_SUB2API_MANAGED \
+      CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_ENABLE_TELEMETRY OTEL_EXPORTER_OTLP_ENDPOINT \
+      DBUS_SESSION_BUS_ADDRESS
+export CLAUDE_SECURESTORAGE_CONFIG_DIR="$PROFILE_HOME"
+export ANTHROPIC_CONFIG_DIR="$PROFILE_HOME"
+if [ -f "$SAFE_DIR/profiles/$ACTIVE_ACCOUNT/gitconfig" ]; then
+    export GIT_CONFIG_GLOBAL="$SAFE_DIR/profiles/$ACTIVE_ACCOUNT/gitconfig"
+    if [ -x "$SAFE_DIR/libexec/git" ]; then
+        export PATH="$SAFE_DIR/libexec:$PATH"
+    fi
+fi
+export TZ="$TZ_VAL"
+export HTTPS_PROXY="http://127.0.0.1:7890"
+export HTTP_PROXY="http://127.0.0.1:7890"
+export ALL_PROXY="socks5://127.0.0.1:7891"
+export NO_PROXY="localhost,127.0.0.1,100.64.0.0/10"
+export NODE_OPTIONS="--dns-result-order=ipv4first"
+export BUN_FEATURE_FLAG_DISABLE_IPV6="1"
+export DISABLE_TELEMETRY="1"
+export DO_NOT_TRACK="1"
+export DISABLE_ERROR_REPORTING="1"
+export CLAUDE_CODE_DISABLE_1P_EVENT_LOGGING="1"
+export CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL="1"
+
+# 6. 首次登录自动归档监听：仅同步凭证与 identity (sync-cred)，不在会话运行中覆写 .claude.json
+MAIN_PID=$$
+if [ ! -s "$CRED_PATH" ] && [ -x "$HOME/.local/bin/cc-switch" ] && [ "${1:-}" != "--version" ] && [ "${1:-}" != "-v" ] && [ "${1:-}" != "--help" ] && [ "${1:-}" != "-h" ]; then
+    (
+        for _ in $(seq 1 360); do
+            kill -0 "$MAIN_PID" 2>/dev/null || exit 0
+            if [ -s "$CRED_PATH" ]; then
+                sleep 2
+                "$HOME/.local/bin/cc-switch" sync-cred --quiet >/dev/null 2>&1 || true
+                exit 0
+            fi
+            sleep 1
+        done
+    ) </dev/null >/dev/null 2>&1 &
+fi
+
+exec "$PROXYCHAINS_BIN" -q -f "$PROXYCHAINS_CONF" "$CLAUDE_BIN" "$@"

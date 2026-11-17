@@ -1,0 +1,14 @@
+# Never commit real account pools, OAuth credentials, or dynamic tunnel configs
+config/accounts.json
+config/sub2api.settings.json
+config/us-tunnel.env
+config/us-tunnel.json
+config/gost.json
+*.pid
+*.log
+*.sha256
+.credentials.json
+identity.json
+.DS_Store
+__pycache__/
+*.pyc

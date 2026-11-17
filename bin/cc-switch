@@ -1,0 +1,1980 @@
+#!/usr/bin/env python3
+"""
+cc-switch: Claude Code (cc-safe) 多账号物理硬隔离与独立美国家宽隧道管理器
+核心架构:
+  1. 账号级物理目录硬隔离: 每账号独占 CLAUDE_CONFIG_DIR = ~/.claude-safe/profiles/<acc>/home，
+     零跨号文件覆盖、零软链接共享，与 claude-sub2api 使用的 ~/.claude 100% 物理分家。
+  2. 零进程参数泄密: curl 请求统一走 `-K -` 标准输入，Gost 隧道走 chmod-600 JSON 配置，ps aux 零明文凭据。
+  3. 切号前双机精准进程树清场: 仅识别 CC_SAFE_MANAGED / ~/.claude-safe / 非中转 claude 进程及其后代，不误杀无关代理任务。
+  4. 6 维独立设备指纹锚定 + 非破坏式配置合并: 保留单号自定义 MCP/Hooks，强制锁定代理与遥测阻断环境变量。
+  5. 全局本机+对端 flock 互斥锁 & ~/.claude-safe 同分区原子暂存同步 (彻底告别 /tmp 暂存隐患)。
+  6. 全链路双通道 (HTTP + SOCKS5h) Fail-Close 强校验 & 封禁状态双机同步熔断。
+"""
+import base64
+import fcntl
+import glob
+import hashlib
+import hmac
+import json
+import os
+import re
+import secrets
+import shlex
+import shutil
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import time
+import uuid
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+from urllib.parse import quote, unquote, urlsplit
+
+HOME = os.path.expanduser("~")
+os.environ["PATH"] = f"{HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin:" + os.environ.get("PATH", "")
+
+SAFE_DIR = os.path.join(HOME, ".claude-safe")
+CFG_DIR = os.path.join(SAFE_DIR, "config")
+LOCK_DIR = os.path.join(SAFE_DIR, "locks")
+PROFILES_DIR = os.path.join(SAFE_DIR, "profiles")
+
+ACCOUNTS_FILE = os.path.join(CFG_DIR, "accounts.json")
+TUNNEL_JSON = os.path.join(CFG_DIR, "us-tunnel.json")
+TUNNEL_ENV = os.path.join(CFG_DIR, "us-tunnel.env")
+LOCK_FILE = os.path.join(LOCK_DIR, "cc.lock")
+
+BIN_DIR = os.path.join(HOME, ".local", "bin")
+CC_SAFE = os.path.join(BIN_DIR, "cc-safe")
+CC_TOTP = os.path.join(BIN_DIR, "cc-totp")
+CC_TUNNEL = os.path.join(BIN_DIR, "cc-us-tunnel")
+CC_CHECK_IP = os.path.join(BIN_DIR, "cc-check-ip")
+CC_AUDIT = os.path.join(BIN_DIR, "cc-audit")
+
+HOSTNAME = socket.gethostname()
+PROXY_HTTP = "http://127.0.0.1:7890"
+PROXY_SOCKS = "socks5h://127.0.0.1:7891"
+ALIAS_RE = re.compile(r"^[a-zA-Z0-9_-]{1,32}$")
+SSH_BASE_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=accept-new"]
+
+for _d in (SAFE_DIR, CFG_DIR, LOCK_DIR, PROFILES_DIR):
+    os.makedirs(_d, mode=0o700, exist_ok=True)
+
+_CACHED_CLAUDE_VER = None
+
+
+def get_claude_version() -> str:
+    global _CACHED_CLAUDE_VER
+    if _CACHED_CLAUDE_VER:
+        return _CACHED_CLAUDE_VER
+    for cand in (os.path.join(BIN_DIR, "claude"), "claude"):
+        try:
+            r = subprocess.run([cand, "--version"], capture_output=True, text=True, timeout=3)
+            m = re.search(r"(\d+\.\d+\.\d+)", r.stdout or "")
+            if m:
+                _CACHED_CLAUDE_VER = m.group(1)
+                return _CACHED_CLAUDE_VER
+        except Exception:
+            continue
+    _CACHED_CLAUDE_VER = "2.1.322"
+    return _CACHED_CLAUDE_VER
+
+
+def validate_alias_or_die(alias: str) -> str:
+    if not alias or not ALIAS_RE.match(alias):
+        print(f"❌ 非法账号别名 '{alias}'：仅允许字母、数字、下划线与连字符 (1-32 位)。", file=sys.stderr)
+        sys.exit(1)
+    return alias
+
+
+def _curl_esc(s: str) -> str:
+    return (s or "").replace("\\", "\\\\").replace('"', '\\"')
+
+
+def safe_curl(
+    url: str,
+    proxy_url: str = PROXY_HTTP,
+    timeout: int = 8,
+    method: str = "GET",
+    headers: dict = None,
+    body: str = None,
+) -> str:
+    lines = [f'url = "{_curl_esc(url)}"']
+    if proxy_url:
+        lines.append(f'proxy = "{_curl_esc(proxy_url)}"')
+    if method != "GET":
+        lines.append(f'request = "{_curl_esc(method)}"')
+    for k, v in (headers or {}).items():
+        lines.append(f'header = "{_curl_esc(f"{k}: {v}")}"')
+    if body is not None:
+        lines.append(f'data = "{_curl_esc(body)}"')
+    res = subprocess.run(
+        ["curl", "-s", "--max-time", str(timeout), "-K", "-"],
+        input="\n".join(lines) + "\n",
+        capture_output=True,
+        text=True,
+    )
+    return res.stdout
+
+
+@contextmanager
+def global_lock(blocking: bool = True):
+    os.makedirs(LOCK_DIR, mode=0o700, exist_ok=True)
+    fd = open(LOCK_FILE, "w", encoding="utf-8")
+    try:
+        flags = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+        fcntl.flock(fd.fileno(), flags)
+        yield True
+    except BlockingIOError:
+        yield False
+    finally:
+        try:
+            fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        fd.close()
+
+
+def atomic_write_json(path: str, obj: dict, mode: int = 0o600):
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def atomic_write_text(path: str, text: str, mode: int = 0o600):
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def detect_tailscale_ip() -> str:
+    try:
+        res = subprocess.run(["tailscale", "ip", "-4"], capture_output=True, text=True, timeout=2)
+        if res.returncode == 0 and res.stdout.strip():
+            return res.stdout.strip().splitlines()[0].strip()
+    except Exception:
+        pass
+    return ""
+
+
+def default_win_proxy() -> str:
+    ts = detect_tailscale_ip()
+    return f"{ts}:7890" if ts else "127.0.0.1:7890"
+
+
+def load_accounts() -> dict:
+    if not os.path.exists(ACCOUNTS_FILE):
+        return {
+            "active": "",
+            "peers": {},
+            "nodes": {},
+            "win_proxy": default_win_proxy(),
+            "expose_tailscale_proxy": True,
+            "accounts": {},
+        }
+    with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
+        d = json.load(f)
+    d.setdefault("peers", {})
+    d.setdefault("nodes", {})
+    if not d.get("win_proxy"):
+        d["win_proxy"] = default_win_proxy()
+    d.setdefault("expose_tailscale_proxy", True)
+    d.setdefault("accounts", {})
+    return d
+
+
+def save_accounts(data: dict):
+    atomic_write_json(ACCOUNTS_FILE, data, 0o600)
+
+
+def get_peer_host(data: dict = None) -> str:
+    d = data or {}
+    # 1. 优先支持直观拓扑 nodes: {"hostA": "100.64.0.1", "hostB": "100.64.0.2"}
+    nodes = d.get("nodes") or {}
+    if isinstance(nodes, dict) and nodes:
+        real_nodes = {k: v for k, v in nodes.items() if k not in ("host-a", "host-b", "host-primary", "host-secondary") and v}
+        if HOSTNAME in real_nodes:
+            for h, ip in real_nodes.items():
+                if h != HOSTNAME and ip:
+                    return ip
+    # 2. 兼容旧版 peers: {"本机hostname": "对端IP"}
+    peers = d.get("peers") or {}
+    if isinstance(peers, dict) and HOSTNAME in peers:
+        val = (peers.get(HOSTNAME) or "").strip()
+        if val:
+            return val
+    return ""
+
+
+def check_topology_warning(data: dict) -> str:
+    nodes = {
+        k: v
+        for k, v in (data.get("nodes") or {}).items()
+        if k not in ("host-a", "host-b", "host-primary", "host-secondary") and v
+    }
+    peers = {
+        k: v
+        for k, v in (data.get("peers") or {}).items()
+        if k not in ("host-a", "host-b", "host-primary", "host-secondary") and v
+    }
+    if (nodes or peers) and not get_peer_host(data):
+        if len(nodes) == 1 and HOSTNAME in nodes:
+            return ""
+        return f"当前主机名 '{HOSTNAME}' 未匹配 nodes/peers 配置，双机同步未生效 (可运行 `cc-switch set-peer <对端IP>` 修复)"
+    return ""
+
+
+def gen_totp(secret_b32: str):
+    try:
+        clean = secret_b32.strip().replace(" ", "").upper()
+        if not clean:
+            return "N/A", 0
+        pad = (8 - len(clean) % 8) % 8
+        key = base64.b32decode(clean + "=" * pad)
+        now = int(time.time())
+        rem = 30 - (now % 30)
+        msg = struct.pack(">Q", now // 30)
+        h = hmac.new(key, msg, hashlib.sha1).digest()
+        offset = h[-1] & 0x0F
+        code = (struct.unpack(">I", h[offset : offset + 4])[0] & 0x7FFFFFFF) % 1000000
+        return f"{code:06d}", rem
+    except Exception:
+        return "N/A", 0
+
+
+def profile_paths(acc_key: str) -> dict:
+    validate_alias_or_die(acc_key)
+    pdir = os.path.join(PROFILES_DIR, acc_key)
+    hdir = os.path.join(pdir, "home")
+    for sub in (pdir, hdir, os.path.join(hdir, "projects"), os.path.join(hdir, "sessions")):
+        os.makedirs(sub, mode=0o700, exist_ok=True)
+    return {
+        "pdir": pdir,
+        "id_file": os.path.join(pdir, "identity.json"),
+        "gitconfig": os.path.join(pdir, "gitconfig"),
+        "home": hdir,
+        "cred": os.path.join(hdir, ".credentials.json"),
+        "claude_json": os.path.join(hdir, ".claude.json"),
+        "settings": os.path.join(hdir, "settings.json"),
+        "projects": os.path.join(hdir, "projects"),
+    }
+
+
+def ensure_profile_identity(acc_key: str) -> dict:
+    paths = profile_paths(acc_key)
+    id_file = paths["id_file"]
+    data = {}
+    if os.path.exists(id_file):
+        try:
+            with open(id_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+
+    changed = False
+    for hex_key in ("userID", "machineID", "summonSidKey"):
+        val = str(data.get(hex_key) or "")
+        if len(val) != 64:
+            data[hex_key] = secrets.token_hex(32)
+            changed = True
+    if not data.get("remoteControlMachineId"):
+        data["remoteControlMachineId"] = str(uuid.uuid4())
+        changed = True
+    if not data.get("firstStartTime"):
+        jitter_sec = int(hashlib.sha256(acc_key.encode()).hexdigest()[:6], 16) % (86400 * 5)
+        dt = datetime.now(timezone.utc) - timedelta(seconds=jitter_sec)
+        data["firstStartTime"] = dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        changed = True
+    if "oauthAccount" not in data:
+        data["oauthAccount"] = None
+        changed = True
+    if "claudeCodeFirstTokenDate" not in data:
+        data["claudeCodeFirstTokenDate"] = None
+        changed = True
+
+    if changed or not os.path.exists(id_file):
+        atomic_write_json(id_file, data, 0o600)
+    return data
+
+
+def parse_valid_cred(raw_text: str):
+    if not raw_text or len(raw_text.strip()) <= 20:
+        return 0, None
+    try:
+        d = json.loads(raw_text)
+        oauth = d.get("claudeAiOauth") or {}
+        at = oauth.get("accessToken", "")
+        rt = oauth.get("refreshToken", "")
+        exp = int(oauth.get("expiresAt", 0) or 0)
+        if at and rt and exp > 0:
+            return exp, raw_text
+    except Exception:
+        pass
+    return 0, None
+
+
+def harvest_profile_oauth_meta(acc_key: str, expected_email: str = ""):
+    """从该账号专属 home/.claude.json 提取首次登录生成的 oauthAccount，固化到 identity.json。"""
+    paths = profile_paths(acc_key)
+    id_data = ensure_profile_identity(acc_key)
+    cj_path = paths["claude_json"]
+    if not os.path.exists(cj_path):
+        return id_data
+    try:
+        with open(cj_path, "r", encoding="utf-8") as f:
+            cj = json.load(f)
+        oa = cj.get("oauthAccount")
+        if isinstance(oa, dict) and oa.get("accountUuid"):
+            if not expected_email or oa.get("emailAddress") == expected_email:
+                changed = False
+                if id_data.get("oauthAccount") != oa:
+                    id_data["oauthAccount"] = oa
+                    changed = True
+                ftd = cj.get("claudeCodeFirstTokenDate")
+                if ftd and id_data.get("claudeCodeFirstTokenDate") != ftd:
+                    id_data["claudeCodeFirstTokenDate"] = ftd
+                    changed = True
+                if changed:
+                    atomic_write_json(paths["id_file"], id_data, 0o600)
+    except Exception:
+        pass
+    return id_data
+
+
+def build_clean_claude_json(existing_cj: dict, id_data: dict, has_cred: bool) -> dict:
+    cver = get_claude_version()
+    clean_projects = {}
+    old_projects = existing_cj.get("projects") if isinstance(existing_cj, dict) else {}
+    if isinstance(old_projects, dict):
+        for proj_path, pval in old_projects.items():
+            entry = {
+                "allowedTools": (pval.get("allowedTools") if isinstance(pval, dict) else None) or [],
+                "hasTrustDialogAccepted": True,
+                "projectOnboardingSeenCount": 1,
+                "hasClaudeMdExternalIncludesApproved": False,
+                "hasClaudeMdExternalIncludesWarningShown": True,
+            }
+            if isinstance(pval, dict) and isinstance(pval.get("mcpServers"), dict):
+                entry["mcpServers"] = pval["mcpServers"]
+            clean_projects[proj_path] = entry
+    for default_proj in (HOME, os.path.join(HOME, "code")):
+        if os.path.exists(default_proj) and default_proj not in clean_projects:
+            clean_projects[default_proj] = {
+                "allowedTools": [],
+                "hasTrustDialogAccepted": True,
+                "projectOnboardingSeenCount": 1,
+                "hasClaudeMdExternalIncludesApproved": False,
+                "hasClaudeMdExternalIncludesWarningShown": True,
+            }
+
+    clean = {
+        "numStartups": max(int(existing_cj.get("numStartups", 5) or 5), 5) if isinstance(existing_cj, dict) else 5,
+        "installMethod": "native",
+        "autoUpdates": False,
+        "autoUpdatesProtectedForNative": True,
+        "hasCompletedOnboarding": True,
+        "lastOnboardingVersion": cver,
+        "lastReleaseNotesSeen": cver,
+        "hasSeenTasksHint": True,
+        "hasSeenAutoModeEntryWarning": True,
+        "hasResetAutoModeOptInForDefaultOffer": True,
+        "shiftEnterKeyBindingInstalled": True,
+        "unpinOpus47LaunchEffort": True,
+        "unpinOpus48LaunchEffort": True,
+        "unpinFable5LaunchEffort": True,
+        "opusProMigrationComplete": True,
+        "sonnet1m45MigrationComplete": True,
+        "migrationVersion": 15,
+        "userID": id_data["userID"],
+        "machineID": id_data["machineID"],
+        "summonSidKey": id_data["summonSidKey"],
+        "remoteControlMachineId": id_data["remoteControlMachineId"],
+        "firstStartTime": id_data["firstStartTime"],
+        "projects": clean_projects,
+        "cachedGrowthBookFeatures": {
+            "tengu_cedar_ember": {"enabled": True, "version": 1, "autoContinue": True},
+            "tengu_frond_boric": {"firstParty": True},
+        },
+    }
+    if isinstance(existing_cj, dict) and isinstance(existing_cj.get("mcpServers"), dict):
+        clean["mcpServers"] = existing_cj["mcpServers"]
+    if id_data.get("claudeCodeFirstTokenDate"):
+        clean["claudeCodeFirstTokenDate"] = id_data["claudeCodeFirstTokenDate"]
+    if has_cred and id_data.get("oauthAccount"):
+        clean["oauthAccount"] = id_data["oauthAccount"]
+    return clean
+
+
+def build_profile_gitconfig(acc_key: str, email: str, git_path: str):
+    git_user = re.sub(r"[^a-zA-Z0-9._-]", "", (email.split("@")[0] if email and "@" in email else acc_key)) or acc_key
+    git_email = email if (email and "@" in email) else f"{acc_key}@users.noreply.github.com"
+    lines = []
+    host_gc = os.path.join(HOME, ".gitconfig")
+    if os.path.isfile(host_gc):
+        lines.append("[include]\n" f"\tpath = {host_gc}\n")
+    lines.append("[user]\n" f"\tname = {git_user}\n" f"\temail = {git_email}\n")
+    atomic_write_text(git_path, "".join(lines), 0o600)
+
+    # 生成仅在 cc-safe 会话 PATH 中生效的 git 垫片，防止 Claude 内部剥离 GIT_CONFIG_GLOBAL 后回退读取宿主机 ~/.gitconfig
+    real_git = "/usr/bin/git"
+    for p in os.environ.get("PATH", "").split(":"):
+        if p.rstrip("/").endswith("/.claude-safe/libexec"):
+            continue
+        cand = os.path.join(p, "git")
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            real_git = cand
+            break
+    libexec_dir = os.path.join(SAFE_DIR, "libexec")
+    os.makedirs(libexec_dir, mode=0o700, exist_ok=True)
+    shim_path = os.path.join(libexec_dir, "git")
+    shim_code = (
+        "#!/usr/bin/env bash\n"
+        'if [ -n "${CC_SAFE_ACCOUNT:-}" ] && [ -f "$HOME/.claude-safe/profiles/$CC_SAFE_ACCOUNT/gitconfig" ]; then\n'
+        '    export GIT_CONFIG_GLOBAL="$HOME/.claude-safe/profiles/$CC_SAFE_ACCOUNT/gitconfig"\n'
+        'elif [ -n "${CLAUDE_CONFIG_DIR:-}" ] && [ -f "$(dirname "$CLAUDE_CONFIG_DIR")/gitconfig" ]; then\n'
+        '    export GIT_CONFIG_GLOBAL="$(dirname "$CLAUDE_CONFIG_DIR")/gitconfig"\n'
+        "fi\n"
+        f'exec "{real_git}" "$@"\n'
+    )
+    atomic_write_text(shim_path, shim_code, 0o755)
+
+
+def build_clean_settings(
+    tz_val: str,
+    existing_settings: dict = None,
+    profile_home: str = "",
+    profile_gitconfig: str = "",
+    isolate_git: bool = True,
+) -> dict:
+    base = dict(existing_settings) if isinstance(existing_settings, dict) else {}
+    merged_env = dict(base.get("env")) if isinstance(base.get("env"), dict) else {}
+    # 移除可能污染个人订阅的中转与外部遥测环境变量
+    for k_bad in (
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "CLAUDE_SUB2API_MANAGED",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CODE_ENABLE_TELEMETRY",
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+    ):
+        merged_env.pop(k_bad, None)
+
+    enforced_env = {
+        "HTTPS_PROXY": "http://127.0.0.1:7890",
+        "HTTP_PROXY": "http://127.0.0.1:7890",
+        "ALL_PROXY": "socks5://127.0.0.1:7891",
+        "NO_PROXY": "localhost,127.0.0.1,100.64.0.0/10",
+        "NODE_OPTIONS": "--dns-result-order=ipv4first",
+        "BUN_FEATURE_FLAG_DISABLE_IPV6": "1",
+        "DISABLE_TELEMETRY": "1",
+        "DO_NOT_TRACK": "1",
+        "DISABLE_ERROR_REPORTING": "1",
+        "CLAUDE_CODE_DISABLE_1P_EVENT_LOGGING": "1",
+        "CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL": "1",
+        "TZ": tz_val or "America/New_York",
+    }
+    if profile_home:
+        enforced_env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = profile_home
+        enforced_env["ANTHROPIC_CONFIG_DIR"] = profile_home
+    if isolate_git and profile_gitconfig:
+        enforced_env["GIT_CONFIG_GLOBAL"] = profile_gitconfig
+    else:
+        merged_env.pop("GIT_CONFIG_GLOBAL", None)
+
+    merged_env.setdefault("API_TIMEOUT_MS", "600000")
+    merged_env.setdefault("ANTHROPIC_DEFAULT_FABLE_MODEL", "claude-fable-5-2")
+    merged_env.setdefault("ANTHROPIC_CUSTOM_MODEL_OPTION", "claude-fable-5-2")
+    merged_env.setdefault("ANTHROPIC_CUSTOM_MODEL_OPTION_NAME", "Fable 5.2")
+    merged_env.setdefault("ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION", "Fable 5.2 (1M context) · Latest flagship model")
+    merged_env.update(enforced_env)
+
+    base["env"] = merged_env
+    base.setdefault("permissions", {"defaultMode": "auto"})
+    base.setdefault("model", "claude-fable-5-2")
+    base.setdefault("effortLevel", "xhigh")
+    base.setdefault("modelSettings", {"claude-fable-5-2": {"effortLevel": "xhigh"}})
+    base.setdefault("skipDangerousModePermissionPrompt", True)
+    base.setdefault("skipWebFetchPreflight", True)
+    return base
+
+
+def apply_profile_locally(acc_key: str) -> tuple:
+    data = load_accounts()
+    acc = data.get("accounts", {}).get(acc_key, {})
+    paths = profile_paths(acc_key)
+    id_data = harvest_profile_oauth_meta(acc_key, acc.get("email", ""))
+    isolate_git = bool(data.get("isolate_git_config", True))
+    if isolate_git:
+        build_profile_gitconfig(acc_key, acc.get("email", ""), paths["gitconfig"])
+
+    for sub in ("telemetry", "statsig", "cache"):
+        t = os.path.join(paths["home"], sub)
+        if os.path.exists(t) and not os.path.islink(t):
+            shutil.rmtree(t, ignore_errors=True)
+
+    exp, _ = parse_valid_cred(open(paths["cred"], "r", encoding="utf-8").read()) if os.path.exists(paths["cred"]) else (0, None)
+    has_cred = exp > 0
+
+    old_cj = {}
+    if os.path.exists(paths["claude_json"]):
+        try:
+            with open(paths["claude_json"], "r", encoding="utf-8") as f:
+                old_cj = json.load(f)
+        except Exception:
+            old_cj = {}
+
+    old_st = {}
+    if os.path.exists(paths["settings"]):
+        try:
+            with open(paths["settings"], "r", encoding="utf-8") as f:
+                old_st = json.load(f)
+        except Exception:
+            old_st = {}
+
+    atomic_write_json(paths["claude_json"], build_clean_claude_json(old_cj, id_data, has_cred), 0o600)
+    atomic_write_json(
+        paths["settings"],
+        build_clean_settings(
+            acc.get("tz", "America/New_York"),
+            old_st,
+            profile_home=paths["home"],
+            profile_gitconfig=paths["gitconfig"],
+            isolate_git=isolate_git,
+        ),
+        0o600,
+    )
+    return has_cred, id_data
+
+
+def write_tunnel_configs(acc: dict, expose_tailscale: bool = True):
+    obj = {
+        "active_account": acc.get("id", ""),
+        "expected_ip": acc.get("ip", ""),
+        "us_proxy": acc.get("proxy", ""),
+        "http_listen": "127.0.0.1:7890",
+        "socks_listen": "127.0.0.1:7891",
+        "expose_tailscale_proxy": bool(expose_tailscale),
+    }
+    atomic_write_json(TUNNEL_JSON, obj, 0o600)
+
+    # 兼容保留 shlex 安全转义的 us-tunnel.env (不直接内嵌未转义双引号，防 $ 展开崩溃)
+    env_text = (
+        "# Claude Code US Fixed Tunnel Configuration (Managed by cc-switch)\n"
+        f"ACTIVE_ACCOUNT={shlex.quote(str(acc.get('id', '')))}\n"
+        f"EXPECTED_IP={shlex.quote(str(acc.get('ip', '')))}\n"
+        f"US_PROXY={shlex.quote(str(acc.get('proxy', '')))}\n"
+        "HTTP_LISTEN='127.0.0.1:7890'\n"
+        "SOCKS_LISTEN='127.0.0.1:7891'\n"
+    )
+    atomic_write_text(TUNNEL_ENV, env_text, 0o600)
+
+
+def probe_tunnel_trace(proxy_url: str = PROXY_HTTP, timeout: int = 6) -> dict:
+    out = safe_curl("https://api.anthropic.com/cdn-cgi/trace", proxy_url=proxy_url, timeout=timeout)
+    res = {}
+    for line in out.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            res[k.strip()] = v.strip()
+    return res
+
+
+def verify_active_egress_or_die(acc: dict):
+    expected_ip = acc.get("ip", "")
+    trace_http = probe_tunnel_trace(PROXY_HTTP, timeout=6)
+    trace_socks = probe_tunnel_trace(PROXY_SOCKS, timeout=6)
+    live_ip = trace_http.get("ip", "")
+    live_loc = trace_http.get("loc", "")
+    socks_ip = trace_socks.get("ip", "")
+    if live_loc != "US" or not live_ip:
+        print(f"❌ [熔断] 本机 HTTP 代理隧道不可用或非 US 出口 (ip={live_ip or '无'}, loc={live_loc or '超时'})！")
+        sys.exit(1)
+    if expected_ip and live_ip != expected_ip:
+        print(f"❌ [熔断] HTTP 出口 IP ({live_ip}) 与账号 [{acc['id']}] 绑定 IP ({expected_ip}) 不匹配！严禁发包！")
+        sys.exit(1)
+    if expected_ip and socks_ip != expected_ip:
+        print(f"❌ [熔断] SOCKS5h 出口 IP ({socks_ip or '无'}) 与绑定 IP ({expected_ip}) 不匹配！严禁发包！")
+        sys.exit(1)
+    return live_ip
+
+
+def _is_claude_code_binary(exe_path: str, argv: list) -> bool:
+    candidates = [exe_path or ""] + [a for a in (argv or [])[:3] if a]
+    for c in candidates:
+        c_norm = c.strip()
+        if (
+            c_norm.endswith("/bin/claude")
+            or "/.local/share/claude/versions/" in c_norm
+            or ("anthropic.claude-code" in c_norm and "/native-binary/claude" in c_norm)
+        ):
+            return True
+    return False
+
+
+def _is_relay_managed(argv: list, env_map: dict) -> bool:
+    if env_map.get("CLAUDE_SUB2API_MANAGED") == "1":
+        return True
+    if env_map.get("ANTHROPIC_BASE_URL"):
+        return True
+    sub2_cfg = os.path.join(HOME, ".claude")
+    if env_map.get("CLAUDE_CONFIG_DIR") == sub2_cfg:
+        return True
+    cmd_join = " ".join(argv or [])
+    if "sub2api.settings.json" in cmd_join or "/bin/claude-sub2api" in cmd_join:
+        return True
+    return False
+
+
+def _scan_user_proc_tree() -> tuple:
+    uid = os.getuid()
+    my_pid = os.getpid()
+    procs = {}
+    children = {}
+    all_ppids = {}
+
+    for pdir in glob.glob("/proc/[0-9]*"):
+        base = os.path.basename(pdir)
+        if not base.isdigit():
+            continue
+        pid = int(base)
+        try:
+            stat_raw = open(f"{pdir}/stat", "rb").read().decode("utf-8", "ignore")
+            rparen = stat_raw.rfind(")")
+            if rparen == -1:
+                continue
+            comm = stat_raw[stat_raw.find("(") + 1 : rparen]
+            rest = stat_raw[rparen + 2 :].split()
+            state = rest[0] if rest else ""
+            ppid = int(rest[1]) if len(rest) > 1 else 0
+            all_ppids[pid] = ppid
+
+            if os.stat(pdir).st_uid != uid or state == "Z":
+                continue
+
+            cmdline_bytes = open(f"{pdir}/cmdline", "rb").read()
+            argv = [x.decode("utf-8", "ignore") for x in cmdline_bytes.split(b"\x00") if x]
+            try:
+                exe = os.readlink(f"{pdir}/exe")
+            except Exception:
+                exe = ""
+
+            env_map = {}
+            try:
+                env_bytes = open(f"{pdir}/environ", "rb").read()
+                for item in env_bytes.split(b"\x00"):
+                    if b"=" in item:
+                        k, v = item.split(b"=", 1)
+                        env_map[k.decode("utf-8", "ignore")] = v.decode("utf-8", "ignore")
+            except Exception:
+                pass
+
+            procs[pid] = {
+                "pid": pid,
+                "ppid": ppid,
+                "state": state,
+                "comm": comm,
+                "exe": exe,
+                "argv": argv,
+                "env": env_map,
+            }
+            children.setdefault(ppid, []).append(pid)
+        except Exception:
+            continue
+
+    ancestors = {my_pid}
+    cur = my_pid
+    for _ in range(64):
+        parent = all_ppids.get(cur, 0)
+        if parent <= 1 or parent in ancestors:
+            break
+        ancestors.add(parent)
+        cur = parent
+
+    return procs, children, ancestors
+
+
+def find_cc_safe_processes(only_rogue_for_account: str = None) -> list:
+    """
+    精准查找本机所有个人订阅 / cc-safe 会话进程及其完整后代进程树 (MCP、工具子进程、watcher 等)。
+    - 仅以明确归属标记判定根进程，绝不因普通任务使用 127.0.0.1:7890 或 proxychains4 而误杀！
+    - 100% 排除: 当前 cc-switch 自身及祖先链路、gost 隧道守护进程、claude-sub2api 中转进程树。
+    """
+    procs, children, ancestors = _scan_user_proc_tree()
+    excluded = set(ancestors)
+
+    relay_roots = []
+    for pid, info in procs.items():
+        if info["comm"] == "gost" or info["exe"].endswith("/gost") or (info["argv"] and info["argv"][0].endswith("/gost")):
+            excluded.add(pid)
+            continue
+        if _is_relay_managed(info["argv"], info["env"]):
+            relay_roots.append(pid)
+
+    stack = list(relay_roots)
+    while stack:
+        rpid = stack.pop()
+        if rpid in excluded:
+            continue
+        excluded.add(rpid)
+        stack.extend(children.get(rpid, []))
+
+    expected_cfg = os.path.join(PROFILES_DIR, only_rogue_for_account, "home") if (only_rogue_for_account and ALIAS_RE.match(only_rogue_for_account)) else ""
+    roots = set()
+
+    for pid, info in procs.items():
+        if pid in excluded:
+            continue
+        env = info["env"]
+        argv = info["argv"]
+        cmd_first_two = " ".join(argv[:2])
+
+        cfg_dir = env.get("CLAUDE_CONFIG_DIR", "")
+        is_cc_safe_owned = (
+            env.get("CC_SAFE_MANAGED") == "1"
+            or cfg_dir.startswith(SAFE_DIR + "/")
+            or cfg_dir == SAFE_DIR
+        )
+        is_cc_safe_wrapper = any(a.endswith("/cc-safe") for a in argv[:2]) or "/bin/cc-safe" in cmd_first_two
+        is_claude_bin = _is_claude_code_binary(info["exe"], argv)
+
+        if not (is_cc_safe_owned or is_cc_safe_wrapper or is_claude_bin):
+            continue
+
+        if only_rogue_for_account:
+            acc_tag = env.get("CC_SAFE_ACCOUNT", "")
+            is_valid_current = (
+                (is_cc_safe_owned or is_cc_safe_wrapper)
+                and acc_tag == only_rogue_for_account
+                and (not cfg_dir or cfg_dir == expected_cfg)
+            )
+            if not is_valid_current:
+                roots.add(pid)
+        else:
+            roots.add(pid)
+
+    if only_rogue_for_account:
+        return [procs[p] for p in sorted(roots) if p in procs]
+
+    target_pids = set()
+    walk = list(roots)
+    while walk:
+        curr = walk.pop()
+        if curr in target_pids or curr in excluded or curr not in procs:
+            continue
+        target_pids.add(curr)
+        walk.extend(children.get(curr, []))
+
+    return [procs[p] for p in sorted(target_pids)]
+
+
+def kill_local_cc_safe_tree() -> dict:
+    killed_pids = set()
+
+    def _signal_targets(sig: int) -> list:
+        targets = find_cc_safe_processes()
+        for info in targets:
+            pid = info["pid"]
+            try:
+                os.kill(pid, sig)
+                killed_pids.add(pid)
+            except ProcessLookupError:
+                pass
+            except Exception:
+                pass
+        return targets
+
+    initial = _signal_targets(signal.SIGTERM)
+    if initial:
+        deadline = time.time() + 1.5
+        while time.time() < deadline:
+            time.sleep(0.1)
+            if not _signal_targets(signal.SIGTERM):
+                break
+
+    survivors = _signal_targets(signal.SIGKILL)
+    if survivors:
+        deadline = time.time() + 1.2
+        while time.time() < deadline:
+            time.sleep(0.1)
+            if not _signal_targets(signal.SIGKILL):
+                break
+
+    remaining = [
+        {"pid": p["pid"], "comm": p["comm"], "cmd": " ".join(p["argv"])[:80]}
+        for p in find_cc_safe_processes()
+    ]
+    return {
+        "killed": len(killed_pids),
+        "killed_pids": sorted(killed_pids),
+        "remaining": remaining,
+    }
+
+
+def kill_running_cc_safe_processes(peer_host: str = None) -> dict:
+    local_res = kill_local_cc_safe_tree()
+    remote_res = {"ok": True, "killed": 0, "killed_pids": [], "remaining": [], "error": ""}
+
+    if peer_host:
+        remote_cmd = "~/.local/bin/cc-switch kill-local"
+        try:
+            res = subprocess.run(
+                ["ssh"] + SSH_BASE_OPTS + [peer_host, remote_cmd],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if res.returncode == 0 and res.stdout.strip():
+                parsed = json.loads(res.stdout.strip().splitlines()[-1])
+                remote_res.update(
+                    {
+                        "ok": len(parsed.get("remaining", [])) == 0,
+                        "killed": int(parsed.get("killed", 0)),
+                        "killed_pids": parsed.get("killed_pids", []),
+                        "remaining": parsed.get("remaining", []),
+                    }
+                )
+            else:
+                remote_res["ok"] = False
+                remote_res["error"] = (res.stderr or res.stdout or f"exit={res.returncode}").strip()[:200]
+        except Exception as e:
+            remote_res["ok"] = False
+            remote_res["error"] = str(e)
+
+    return {"local": local_res, "remote": remote_res}
+
+
+def sync_accounts_only_to_peer(peer_host: str, stop_peer_tunnel: bool = False) -> bool:
+    if not peer_host or not os.path.exists(ACCOUNTS_FILE):
+        return True
+    nonce = f"{os.getpid()}_{secrets.token_hex(4)}"
+    stage_rel = f".claude-safe/.stage_{nonce}"
+    try:
+        subprocess.run(
+            ["ssh"] + SSH_BASE_OPTS + [peer_host, f"mkdir -p -m 700 ~/.claude-safe/config ~/.claude-safe/locks ~/{stage_rel}"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=6,
+        )
+        subprocess.run(
+            ["scp", "-q"] + SSH_BASE_OPTS + [ACCOUNTS_FILE, f"{peer_host}:~/{stage_rel}/accounts.json"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=6,
+        )
+        stop_snip = "~/.local/bin/cc-us-tunnel stop >/dev/null 2>&1 || true" if stop_peer_tunnel else "true"
+        remote_cmd = f"""
+set -e
+STAGE="$HOME/{stage_rel}"
+trap 'rm -rf "$STAGE"' EXIT
+(
+  flock -w 10 9
+  chmod 600 "$STAGE/accounts.json"
+  mv "$STAGE/accounts.json" "$HOME/.claude-safe/config/accounts.json"
+) 9>"$HOME/.claude-safe/locks/cc.lock"
+{stop_snip}
+"""
+        r = subprocess.run(["ssh"] + SSH_BASE_OPTS + [peer_host, remote_cmd], capture_output=True, text=True, timeout=12)
+        return r.returncode == 0
+    except Exception:
+        subprocess.run(["ssh"] + SSH_BASE_OPTS + [peer_host, f"rm -rf ~/{stage_rel}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return False
+
+
+def sync_to_peer(acc_key: str, restart_tunnel: bool = False, quiet: bool = False, cred_only: bool = False) -> tuple:
+    validate_alias_or_die(acc_key)
+    data = load_accounts()
+    peer_host = get_peer_host(data)
+    if not peer_host:
+        return True, "单机模式"
+    paths = profile_paths(acc_key)
+    ensure_profile_identity(acc_key)
+    has_cred = os.path.exists(paths["cred"]) and os.path.getsize(paths["cred"]) > 20
+
+    nonce = f"{os.getpid()}_{secrets.token_hex(4)}"
+    stage_rel = f".claude-safe/.stage_{nonce}"
+
+    try:
+        subprocess.run(
+            [
+                "ssh",
+                *SSH_BASE_OPTS,
+                peer_host,
+                f"mkdir -p -m 700 ~/.claude-safe/config ~/.claude-safe/locks ~/.claude-safe/logs ~/.claude-safe/profiles/{acc_key}/home ~/{stage_rel}",
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=6,
+        )
+        files_to_copy = [paths["id_file"]]
+        if not cred_only:
+            for cfg_f in (ACCOUNTS_FILE, TUNNEL_JSON, TUNNEL_ENV):
+                if os.path.exists(cfg_f):
+                    files_to_copy.append(cfg_f)
+        if has_cred:
+            files_to_copy.append(paths["cred"])
+
+        subprocess.run(
+            ["scp", "-q", *SSH_BASE_OPTS, *files_to_copy, f"{peer_host}:~/{stage_rel}/"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=8,
+        )
+
+        apply_snip = "" if cred_only else f"~/.local/bin/cc-switch apply-local {acc_key} >/dev/null 2>&1 || true"
+        remote_cmd = f"""
+set -e
+STAGE="$HOME/{stage_rel}"
+trap 'rm -rf "$STAGE"' EXIT
+(
+  flock -w 10 9
+  for f in accounts.json us-tunnel.json us-tunnel.env; do
+    if [ -f "$STAGE/$f" ]; then
+      chmod 600 "$STAGE/$f"
+      mv "$STAGE/$f" "$HOME/.claude-safe/config/$f"
+    fi
+  done
+  if [ -f "$STAGE/identity.json" ]; then
+    chmod 600 "$STAGE/identity.json"
+    mv "$STAGE/identity.json" "$HOME/.claude-safe/profiles/{acc_key}/identity.json"
+  fi
+  if [ -f "$STAGE/.credentials.json" ]; then
+    chmod 600 "$STAGE/.credentials.json"
+    mv "$STAGE/.credentials.json" "$HOME/.claude-safe/profiles/{acc_key}/home/.credentials.json"
+  fi
+) 9>"$HOME/.claude-safe/locks/cc.lock"
+rm -rf "$STAGE"
+{apply_snip}
+"""
+        if restart_tunnel:
+            remote_cmd += """
+~/.local/bin/cc-us-tunnel restart >/dev/null 2>&1 || true
+HTTP_IP=$(curl -s -x http://127.0.0.1:7890 --max-time 6 https://api.anthropic.com/cdn-cgi/trace | grep "^ip=" | cut -d= -f2 || true)
+SOCKS_IP=$(curl -s -x socks5h://127.0.0.1:7891 --max-time 6 https://api.anthropic.com/cdn-cgi/trace | grep "^ip=" | cut -d= -f2 || true)
+echo "${HTTP_IP}|${SOCKS_IP}"
+"""
+        res = subprocess.run(
+            ["ssh", *SSH_BASE_OPTS, peer_host, remote_cmd],
+            capture_output=True,
+            text=True,
+            timeout=18,
+        )
+        peer_ips = res.stdout.strip().splitlines()[-1] if (restart_tunnel and res.stdout.strip()) else ""
+        return res.returncode == 0, peer_ips
+    except Exception as e:
+        subprocess.run(["ssh", *SSH_BASE_OPTS, peer_host, f"rm -rf ~/{stage_rel}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if not quiet:
+            print(f"⚠️  同步至对端 ({peer_host}) 失败: {e}")
+        return False, ""
+
+
+def cmd_status():
+    data = load_accounts()
+    active_key = data.get("active", "")
+    accounts = data.get("accounts", {})
+    win_proxy = data.get("win_proxy") or default_win_proxy()
+
+    if active_key and active_key in accounts:
+        harvest_profile_oauth_meta(active_key, accounts[active_key].get("email", ""))
+
+    print("====================================================================================")
+    print("🛡️  cc-safe 多账号物理硬隔离与独立美国家宽管理器")
+    print("   • cc-safe        -> ~/.claude-safe/profiles/<账号>/home (独立目录/指纹/专线熔断)")
+    print("   • claude-sub2api -> ~/.claude                           (中转专用，零个人订阅凭证)")
+    print("====================================================================================")
+    topo_warn = check_topology_warning(data)
+    if topo_warn:
+        print(f"⚠️  [拓扑提示] {topo_warn}")
+        print("------------------------------------------------------------------------------------")
+
+    if not accounts:
+        print("📭 当前尚未录入任何账号。请运行以下命令添加首个账号：")
+        print("   cc-switch add '邮箱----密码----TOTP密钥----sid(可留空)----host:port:user:pass' acc1")
+        print("   (或运行 `cc-switch add -` 交互式输入，避免密码留在终端历史)")
+    else:
+        for k, v in accounts.items():
+            is_cur = k == active_key
+            st = v.get("status", "active")
+            paths = profile_paths(k)
+            exp, _ = parse_valid_cred(open(paths["cred"], "r", encoding="utf-8").read()) if os.path.exists(paths["cred"]) else (0, None)
+            if st == "banned":
+                state_tag = "🚫 已封禁 (熔断锁死)"
+            elif exp > 0:
+                state_tag = "✅ 已登录 (切号免重登)"
+            else:
+                state_tag = "⏳ 待首次登录"
+            prefix = "👉 [当前] " if is_cur else "          "
+            print(f"{prefix}{k:<10} | {v.get('email',''):<28} | IP: {v.get('ip',''):<15} | {state_tag}")
+
+    print("------------------------------------------------------------------------------------")
+    if active_key and active_key in accounts:
+        cur = accounts[active_key]
+        paths = profile_paths(active_key)
+        id_data = ensure_profile_identity(active_key)
+        totp_code, rem = gen_totp(cur.get("totp", ""))
+        exp, _ = parse_valid_cred(open(paths["cred"], "r", encoding="utf-8").read()) if os.path.exists(paths["cred"]) else (0, None)
+        st = cur.get("status", "active")
+        peer_host = get_peer_host(data)
+        print(f"📌 当前激活账号 : {active_key} ({cur.get('email', '')}) [{'🚫 BANNED' if st == 'banned' else '🟢 ACTIVE'}]")
+        print(f"📁 专属隔离目录 : ~/.claude-safe/profiles/{active_key}/home")
+        print(f"🌍 绑定美国家宽 : {cur.get('ip', '')} ({cur.get('loc', '')}) | 时区: {cur.get('tz', 'America/New_York')}")
+        print(f"🖧  集群拓扑模式 : {f'双机同步 (对端 {peer_host})' if peer_host else '单机模式'}")
+        print(f"🧬 专属设备指纹 : userID={id_data['userID'][:16]}... | machineID={id_data['machineID'][:16]}...")
+        print(f"🔒 登录密码     : ****** (运行 `cc-switch pass` 查看) | 🔢 2FA: {totp_code} ({rem}s)")
+        print(f"🔐 登录态状态   : {'✅ 已就绪 (直接运行 cc-safe)' if exp > 0 else '⏳ 未登录 (运行 cc-safe 后执行 /login)'}")
+        win_cmd = f'chrome --user-data-dir="%USERPROFILE%\\.claude-chrome\\{active_key}" --proxy-server={win_proxy}'
+        print(f"🖥️  Win+R 浏览器 : {win_cmd}")
+        print("------------------------------------------------------------------------------------")
+    print("💡 命令: cc-switch <账号> | add | kill | usage | reset | check-ip | doctor | audit | sync | set-peer | import-session")
+    print("====================================================================================")
+
+
+def cmd_kill():
+    with global_lock(blocking=True):
+        data = load_accounts()
+        peer_host = get_peer_host(data)
+        res = kill_running_cc_safe_processes(peer_host=peer_host)
+        loc = res["local"]
+        rem = res["remote"]
+        print(
+            f"🛑 [进程清场] 本机 ({HOSTNAME}) 已终止: {loc['killed']} 个进程 (残留: {len(loc['remaining'])})"
+            + (
+                f" | 对端 ({peer_host}) 已终止: {rem['killed']} 个进程 (残留: {len(rem['remaining'])})"
+                if peer_host
+                else ""
+            )
+        )
+        failed = False
+        if loc["remaining"]:
+            print(f"❌ 本机仍有无法终止的残留进程: {loc['remaining']}")
+            failed = True
+        if peer_host and (not rem["ok"] or rem["remaining"]):
+            print(f"❌ 对端 ({peer_host}) 清场异常或有残留: error={rem['error'] or '无'}, remaining={rem['remaining']}")
+            failed = True
+        if failed:
+            sys.exit(1)
+        print("✅ cc-safe / 个人订阅进程树已 100% 清零 (claude-sub2api 与其它普通代理任务不受影响)。")
+
+
+def cmd_switch(target_key: str, force: bool = False):
+    with global_lock(blocking=True):
+        data = load_accounts()
+        accounts = data.get("accounts", {})
+        if target_key not in accounts:
+            for k, v in accounts.items():
+                if v.get("email", "").startswith(target_key):
+                    target_key = k
+                    break
+        if target_key not in accounts:
+            avail = ", ".join(accounts.keys()) or "(暂无已录入账号，请先运行 cc-switch add)"
+            print(f"❌ 未找到账号 '{target_key}'。可用账号: {avail}")
+            sys.exit(1)
+
+        validate_alias_or_die(target_key)
+        acc = accounts[target_key]
+        if acc.get("status") == "banned" and not force:
+            print(f"🚫 拒绝切换：账号 [{target_key}] ({acc.get('email')}) 已标记为封禁 (banned)！")
+            print("   严禁启用已封禁账号或其关联代理 IP。如需强制诊断请加 --force。")
+            sys.exit(1)
+
+        old_key = data.get("active", "")
+        if old_key and old_key in accounts and ALIAS_RE.match(old_key):
+            harvest_profile_oauth_meta(old_key, accounts[old_key].get("email", ""))
+
+        peer_host = get_peer_host(data)
+        kill_res = kill_running_cc_safe_processes(peer_host=peer_host)
+        kl = kill_res["local"]["killed"]
+        kr = kill_res["remote"]["killed"]
+        loc_rem = kill_res["local"]["remaining"]
+        rem_ok = kill_res["remote"]["ok"]
+        rem_rem = kill_res["remote"]["remaining"]
+
+        if kl > 0 or kr > 0:
+            print(f"🛑 [进程树清场] 已终止残留的 cc-safe 进程及其子进程树 (本机: {kl}, 对端: {kr})。")
+        else:
+            print("✅ [进程树清场] 零残留旧会话进程。")
+
+        if (loc_rem or (peer_host and (not rem_ok or rem_rem))) and not force:
+            if loc_rem:
+                print(f"❌ [Fail-Close 熔断] 本机存在无法终止的残留进程: {loc_rem}")
+            if peer_host and (not rem_ok or rem_rem):
+                print(
+                    f"❌ [Fail-Close 熔断] 对端 ({peer_host}) 进程清场未确认完成 "
+                    f"(error={kill_res['remote']['error'] or '无'}, remaining={rem_rem})！"
+                )
+            print("🛑 为防止残留进程携带旧 Token 借道新 IP 发包，已中止切号（确认忽略请加 --force）。")
+            sys.exit(1)
+
+        expected_ip = acc.get("ip", "")
+        print(f"🔄 正在切换至账号 [{target_key}] ({acc['email']}) -> 专属 IP: {expected_ip} ({acc.get('loc', '')})...")
+        data["active"] = target_key
+        save_accounts(data)
+        write_tunnel_configs(acc, expose_tailscale=data.get("expose_tailscale_proxy", True))
+        has_cred, _ = apply_profile_locally(target_key)
+
+        subprocess.run([CC_TUNNEL, "restart"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        trace_http = probe_tunnel_trace(PROXY_HTTP, timeout=6)
+        trace_socks = probe_tunnel_trace(PROXY_SOCKS, timeout=6)
+        live_http_ip = trace_http.get("ip", "")
+        live_socks_ip = trace_socks.get("ip", "")
+        live_loc = trace_http.get("loc", "")
+
+        tunnel_failed = False
+        if live_http_ip == expected_ip and live_socks_ip == expected_ip and live_loc == "US":
+            print(f"✅ 本机 ({HOSTNAME}) 双通道核验通过: HTTP & SOCKS5h 出口 IP = {live_http_ip} ({live_loc})")
+        else:
+            print(
+                f"❌ [Fail-Close] 本机 ({HOSTNAME}) 隧道出口异常: "
+                f"HTTP={live_http_ip or '超时'} ({live_loc or '未知'}), SOCKS5h={live_socks_ip or '超时'}, 预期={expected_ip}！"
+            )
+            tunnel_failed = True
+
+        if peer_host:
+            ok, peer_ips = sync_to_peer(target_key, restart_tunnel=True, quiet=False)
+            p_http, p_socks = (peer_ips.split("|") + ["", ""])[:2] if peer_ips else ("", "")
+            if ok and p_http == expected_ip and p_socks == expected_ip:
+                print(f"✅ 对端 ({peer_host}) 隔离档案与双通道隧道已同步 (出口 IP = {p_http})！")
+            else:
+                print(
+                    f"❌ [Fail-Close] 对端 ({peer_host}) 同步或隧道出口异常: "
+                    f"sync_ok={ok}, HTTP={p_http or '超时'}, SOCKS5h={p_socks or '超时'}, 预期={expected_ip}！"
+                )
+                tunnel_failed = True
+
+        post_kill = kill_running_cc_safe_processes(peer_host=peer_host)
+        pkl, pkr = post_kill["local"]["killed"], post_kill["remote"]["killed"]
+        if pkl > 0 or pkr > 0:
+            print(f"🧹 [二次兜底清场] 已额外清理切号期间并发派生的进程 (本机: {pkl}, 对端: {pkr})。")
+
+        if tunnel_failed and not force:
+            print("🛑 隧道出口未通过严格一致性核验，请排查代理连通性（强制忽略请加 --force）。")
+            sys.exit(1)
+
+        print("------------------------------------------------------------------------------------")
+        if has_cred:
+            print(f"🎉 账号 [{target_key}] 已就绪，直接运行 `cc-safe` 即可进入专属隔离空间！")
+        else:
+            win_proxy = data.get("win_proxy") or default_win_proxy()
+            totp_code, _ = gen_totp(acc.get("totp", ""))
+            win_cmd = f'chrome --user-data-dir="%USERPROFILE%\\.claude-chrome\\{target_key}" --proxy-server={win_proxy}'
+            print(f"⏳ 账号 [{target_key}] 尚未登录，请执行首次同源登录：")
+            print(f"   1. Win+R 打开专属代理 Chrome: {win_cmd}")
+            print("   2. 终端运行 `cc-safe` 并输入 `/login`")
+            print(f"   3. 邮箱: {acc['email']} | 密码: `cc-switch pass` | 2FA: {totp_code} (`cc-totp`)")
+            print("   4. 登录成功后自动同步（也可手动运行 `cc-switch sync`）")
+
+
+def cmd_sync(quiet: bool = False, cred_only: bool = False):
+    with global_lock(blocking=True):
+        data = load_accounts()
+        active_key = data.get("active", "")
+        if not active_key or active_key not in data.get("accounts", {}):
+            if not quiet:
+                print("❌ 当前无有效激活账号。")
+            sys.exit(1)
+        acc = data["accounts"][active_key]
+        harvest_profile_oauth_meta(active_key, acc.get("email", ""))
+        if not cred_only:
+            write_tunnel_configs(acc, expose_tailscale=data.get("expose_tailscale_proxy", True))
+            has_cred, _ = apply_profile_locally(active_key)
+        else:
+            paths = profile_paths(active_key)
+            exp, _ = parse_valid_cred(open(paths["cred"], "r", encoding="utf-8").read()) if os.path.exists(paths["cred"]) else (0, None)
+            has_cred = exp > 0
+        ok, _ = sync_to_peer(active_key, restart_tunnel=False, quiet=quiet, cred_only=cred_only)
+        if not quiet:
+            print(f"✅ 账号 [{active_key}] 档案与凭证已同步 ({'含有效登录态' if has_cred else '仅配置，待登录'} | 对端同步: {'成功' if ok else '失败'})。")
+
+
+def cmd_auto_sync():
+    """定时任务无锁竞争自愈同步：仅同步当前激活账号专属 home/.credentials.json。"""
+    with global_lock(blocking=False) as acquired:
+        if not acquired:
+            return
+        data = load_accounts()
+        active_key = data.get("active", "")
+        if not active_key or active_key not in data.get("accounts", {}) or not ALIAS_RE.match(active_key):
+            return
+        acc = data["accounts"][active_key]
+        if acc.get("status") == "banned":
+            return
+
+        paths = profile_paths(active_key)
+        local_cred = paths["cred"]
+        local_exp, local_raw = (
+            parse_valid_cred(open(local_cred, "r", encoding="utf-8").read()) if os.path.exists(local_cred) else (0, None)
+        )
+
+        peer_host = get_peer_host(data)
+        peer_ok = False
+        peer_exp, peer_raw = 0, None
+        peer_rel = f"~/.claude-safe/profiles/{active_key}/home/.credentials.json"
+        if peer_host:
+            try:
+                res = subprocess.run(
+                    ["ssh", *SSH_BASE_OPTS, peer_host, f"cat {peer_rel} 2>/dev/null || true"],
+                    capture_output=True,
+                    text=True,
+                    timeout=6,
+                )
+                if res.returncode == 0:
+                    peer_ok = True
+                    peer_exp, peer_raw = parse_valid_cred(res.stdout.strip())
+            except Exception:
+                pass
+
+        best_exp, best_raw = (local_exp, local_raw) if local_exp >= peer_exp else (peer_exp, peer_raw)
+        if best_exp <= 0 or not best_raw:
+            return
+
+        if local_exp != best_exp:
+            atomic_write_text(local_cred, best_raw, 0o600)
+
+        harvest_profile_oauth_meta(active_key, acc.get("email", ""))
+
+        if peer_ok and peer_exp != best_exp:
+            write_cmd = (
+                f"mkdir -p -m 700 ~/.claude-safe/locks ~/.claude-safe/profiles/{active_key}/home && "
+                f"( flock -w 5 9 && tmp=$(mktemp ~/.claude-safe/profiles/{active_key}/home/.cred.XXXXXX) && "
+                f'cat > "$tmp" && chmod 600 "$tmp" && mv "$tmp" {peer_rel} ) 9>~/.claude-safe/locks/cc.lock'
+            )
+            try:
+                subprocess.run(
+                    ["ssh", *SSH_BASE_OPTS, peer_host, write_cmd],
+                    input=best_raw,
+                    text=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=6,
+                )
+            except Exception:
+                pass
+
+
+def _extract_proxy_user_base(proxy_url: str) -> str:
+    try:
+        u = unquote(urlsplit(proxy_url).username or "")
+        return u.split("-ip-")[0] if "-ip-" in u else u
+    except Exception:
+        return ""
+
+
+def _parse_proxy_input(proxy_raw: str) -> tuple:
+    s = proxy_raw.strip()
+    if "://" in s:
+        u = urlsplit(s)
+        if not u.hostname or not u.port:
+            print("❌ 代理 URL 格式错误！应为 http(s)|socks5://user:pass@host:port", file=sys.stderr)
+            sys.exit(1)
+        scheme = u.scheme.lower()
+        puser = unquote(u.username or "")
+        ppass = unquote(u.password or "")
+        auth_part = f"{quote(puser, safe='')}:{quote(ppass, safe='')}@" if (puser or ppass) else ""
+        return f"{scheme}://{auth_part}{u.hostname}:{u.port}", f"{u.hostname}:{u.port}"
+
+    p_parts = s.split(":")
+    if len(p_parts) < 4:
+        print("❌ 代理段格式错误！应为 host:port:user:pass 或 http://user:pass@host:port", file=sys.stderr)
+        sys.exit(1)
+    host, port, puser, ppass = p_parts[0].strip(), p_parts[1].strip(), p_parts[2], ":".join(p_parts[3:])
+    if not port.isdigit():
+        print(f"❌ 代理端口非法: '{port}'", file=sys.stderr)
+        sys.exit(1)
+    encoded_url = f"http://{quote(puser, safe='')}:{quote(ppass, safe='')}@{host}:{port}"
+    return encoded_url, f"{host}:{port}"
+
+
+def cmd_add(raw_str: str, alias: str = None, force: bool = False):
+    if raw_str == "-":
+        if sys.stdin.isatty():
+            print("请输入账号串 (格式: 邮箱----密码----TOTP密钥----sid(可空)----host:port:user:pass):")
+        raw_str = sys.stdin.readline().strip()
+
+    parts = [p.strip() for p in raw_str.strip().split("----")]
+    if len(parts) == 4:
+        email, passwd, totp, proxy_raw = parts
+        sid = ""
+    elif len(parts) >= 5:
+        email, passwd, totp, sid, proxy_raw = parts[0], parts[1], parts[2], parts[3], parts[4]
+    else:
+        print("❌ 格式错误！支持 5 段 (邮箱----密码----TOTP----sid----host:port:user:pass) 或 4 段 (不含 sid)")
+        sys.exit(1)
+
+    proxy_url, host_port = _parse_proxy_input(proxy_raw)
+
+    if not alias:
+        alias = re.sub(r"[^a-zA-Z0-9]", "", email.split("@")[0])[:12].lower() or "acc1"
+    validate_alias_or_die(alias)
+
+    print(f"🔍 正在检测新账号 [{alias}] ({email}) 的专属代理 ({host_port})...")
+    trace = probe_tunnel_trace(proxy_url, timeout=8)
+    ip = trace.get("ip", "")
+    loc_cc = trace.get("loc", "")
+    if not ip or loc_cc != "US":
+        print(f"❌ 代理不可用或非美国出口 (ip={ip or '连接失败'}, loc={loc_cc or '未知'})！拒绝录入。")
+        sys.exit(1)
+
+    with global_lock(blocking=True):
+        data = load_accounts()
+        ip_octets = ip.split(".")
+        new_u_base = _extract_proxy_user_base(proxy_url)
+        for k, old in data.get("accounts", {}).items():
+            if k == alias:
+                continue
+            old_ip = old.get("ip", "")
+            old_octets = old_ip.split(".")
+            old_st = old.get("status", "active")
+            if old_ip == ip:
+                print(f"🚫 [防关联拦截] 新代理 IP ({ip}) 与已有账号 [{k}] ({old_st}) 完全相同！严禁多号共用同 IP！")
+                sys.exit(1)
+            if len(ip_octets) == 4 and len(old_octets) == 4:
+                if ip_octets[:3] == old_octets[:3] and not force:
+                    print(f"🚫 [防关联拦截] 新 IP ({ip}) 与账号 [{k}] ({old_ip}, {old_st}) 处于同一 /24 子网！已拦截（忽略请加 --force）。")
+                    sys.exit(1)
+                if ip_octets[:2] == old_octets[:2] and old_st == "banned" and not force:
+                    print(f"🚫 [防关联拦截] 新 IP ({ip}) 与已封禁账号 [{k}] ({old_ip}) 处于同一 /16 ISP 号段 ({ip_octets[0]}.{ip_octets[1]}.*.*)！")
+                    print("   同 /16 静态 ISP 段易触发关联风控，建议更换其它州/ASN 住宅代理（忽略请加 --force）。")
+                    sys.exit(1)
+            old_u_base = _extract_proxy_user_base(old.get("proxy", ""))
+            if new_u_base and new_u_base == old_u_base and old_st == "banned":
+                print(f"⚠️ [提示] 新代理与已封禁账号 [{k}] 共享代理商子账户 ({new_u_base})，但出口 IP 不同 ({ip} vs {old_ip})。")
+
+    info_out = safe_curl("https://ipinfo.io/json", proxy_url=proxy_url, timeout=8)
+    try:
+        info = json.loads(info_out)
+    except Exception:
+        info = {}
+    city = info.get("city", "")
+    region = info.get("region", "")
+    org = info.get("org", "")
+    tz = info.get("timezone", "America/New_York")
+    loc = f"{city}, {region} ({org})".strip(", ()") or "US"
+
+    if os.path.exists(CC_CHECK_IP):
+        chk_env = dict(os.environ)
+        chk_env["CC_CHECK_PROXY_URL"] = proxy_url
+        chk = subprocess.run([CC_CHECK_IP], env=chk_env)
+        if chk.returncode != 0 and not force:
+            print("🛑 新代理未通过 IP 纯净度准入体检，已中止添加（如确认继续请加 --force）。")
+            sys.exit(1)
+
+    with global_lock(blocking=True):
+        data = load_accounts()
+        data["accounts"][alias] = {
+            "id": alias,
+            "label": f"{alias} ({email})",
+            "status": "active",
+            "email": email,
+            "pass": passwd,
+            "totp": totp,
+            "sid": sid,
+            "proxy": proxy_url,
+            "ip": ip,
+            "loc": loc,
+            "tz": tz,
+        }
+        save_accounts(data)
+        ensure_profile_identity(alias)
+
+    print(f"✅ 已录入新账号 [{alias}]: IP={ip} | 属地={loc} | 时区={tz}")
+    cmd_switch(alias, force=force)
+
+
+def _enforce_ban_lockdown(target_key: str):
+    """将指定账号设为 banned，并在其为当前激活账号时立即清场双机进程、停用隧道并同步对端。"""
+    with global_lock(blocking=True):
+        data = load_accounts()
+        if target_key not in data.get("accounts", {}):
+            print(f"❌ 未找到账号 '{target_key}'")
+            sys.exit(1)
+        data["accounts"][target_key]["status"] = "banned"
+        save_accounts(data)
+        is_active = data.get("active") == target_key
+        peer_host = get_peer_host(data)
+        if is_active:
+            kill_running_cc_safe_processes(peer_host=peer_host)
+            subprocess.run([CC_TUNNEL, "stop"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        sync_accounts_only_to_peer(peer_host, stop_peer_tunnel=is_active)
+
+
+def _mark_banned_on_hold(active_key: str, raw_resp: str):
+    if "account_on_hold" in (raw_resp or ""):
+        _enforce_ban_lockdown(active_key)
+        print(f"🚫 检测到服务端返回 account_on_hold，已自动将账号 [{active_key}] 双机标记为 banned 并停用隧道！")
+
+
+def _load_active_oauth_token(active_key: str) -> tuple:
+    paths = profile_paths(active_key)
+    if not os.path.exists(paths["cred"]):
+        print(f"❌ 账号 [{active_key}] 尚未登录，无法查询额度。")
+        sys.exit(1)
+    try:
+        cred = json.load(open(paths["cred"], "r", encoding="utf-8"))
+    except Exception:
+        cred = {}
+    oauth = cred.get("claudeAiOauth") or {}
+    token = oauth.get("accessToken", "")
+    exp_ms = int(oauth.get("expiresAt", 0) or 0)
+    if not token:
+        print("❌ 未找到有效 accessToken。")
+        sys.exit(1)
+    if 0 < exp_ms < int(time.time() * 1000):
+        print("⚠️ [提示] 本地缓存 accessToken 已过期；若报 401 请运行一次 `cc-safe` 自动刷新凭证。")
+    return token, paths
+
+
+def cmd_usage():
+    data = load_accounts()
+    active_key = data.get("active", "")
+    acc = data.get("accounts", {}).get(active_key)
+    if not acc:
+        print("❌ 当前未激活任何有效账号。")
+        sys.exit(1)
+
+    verify_active_egress_or_die(acc)
+    harvest_profile_oauth_meta(active_key, acc.get("email", ""))
+    token, _ = _load_active_oauth_token(active_key)
+    cver = get_claude_version()
+
+    out = safe_curl(
+        "https://api.anthropic.com/api/oauth/usage?cedar_ember=1&at_wall=1&offerSurface=cli_menu&skip_spend=1",
+        proxy_url=PROXY_HTTP,
+        timeout=8,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "anthropic-beta": "oauth-2025-04-20",
+            "User-Agent": f"claude-cli/{cver} (external, cli)",
+        },
+    )
+    _mark_banned_on_hold(active_key, out)
+    try:
+        u = json.loads(out)
+    except Exception:
+        print(f"❌ 查询失败: {out[:200]}")
+        sys.exit(1)
+
+    if u.get("type") == "error" or "error" in u:
+        print(f"❌ 账号 [{active_key}] 鉴权异常: {json.dumps(u, ensure_ascii=False)}")
+        sys.exit(1)
+
+    tz_cn = timezone(timedelta(hours=8))
+    now_utc = datetime.now(timezone.utc)
+
+    def fmt_reset(iso_str):
+        if not iso_str:
+            return "未知"
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        secs = int((dt - now_utc).total_seconds())
+        rem_s = "已刷新" if secs <= 0 else f"剩余 {secs // 3600}小时 {(secs % 3600) // 60}分钟"
+        return f"{dt.astimezone(tz_cn).strftime('%Y-%m-%d %H:%M:%S')} (北京时间) [{rem_s}]"
+
+    print("====================================================================================")
+    print(f"📊 Claude 实时额度查询 — 账号: {active_key} ({acc['email']}) | 出口 IP: {acc['ip']}")
+    print("====================================================================================")
+    fh = u.get("five_hour") or {}
+    sd = u.get("seven_day") or {}
+    print(f"⏱️  5小时窗口已用 : {fh.get('utilization', 0):>5.1f}%  | 刷新: {fmt_reset(fh.get('resets_at'))}")
+    sd_pct = sd.get("utilization", 0)
+    print(f"📅 7天周总额已用 : {sd_pct:>5.1f}%  | 刷新: {fmt_reset(sd.get('resets_at'))}  {'🔴 已满' if sd_pct >= 100 else '🟢 正常'}")
+    for lim in u.get("limits") or []:
+        if lim.get("kind") == "weekly_scoped" and (lim.get("scope") or {}).get("model"):
+            mname = lim["scope"]["model"].get("display_name", "Scoped")
+            print(f"✨ {mname:<8} 专项周额 : {lim.get('percent', 0):>5.1f}%  | 刷新: {fmt_reset(lim.get('resets_at'))}")
+
+    grants = ((u.get("cedar_ember") or {}).get("grants")) or []
+    print("------------------------------------------------------------------------------------")
+    if grants:
+        print("🎟️  额度重置卡 (`cc-switch reset` 或 `/limit-reset`):")
+        for g in grants:
+            usable = g.get("usable_now", False)
+            st_s = "🟢 立即可用 (`cc-switch reset`)" if usable else f"⏸️ 暂不可用 ({g.get('unavailable_reason')})"
+            print(f"   • [{g.get('id')}] 剩余 {g.get('resets_left', 0)}/{g.get('resets_total', 0)} 张 (至 {(g.get('ends_at') or '')[:10]}) | {st_s}")
+    else:
+        print("🎟️  额度重置卡 : 当前账号暂无 Reset 卡")
+    print("====================================================================================")
+
+
+def cmd_reset():
+    data = load_accounts()
+    active_key = data.get("active", "")
+    acc = data.get("accounts", {}).get(active_key)
+    if not acc:
+        print("❌ 当前未激活任何有效账号。")
+        sys.exit(1)
+
+    verify_active_egress_or_die(acc)
+    id_data = harvest_profile_oauth_meta(active_key, acc.get("email", ""))
+    token, _ = _load_active_oauth_token(active_key)
+    org_uuid = (id_data.get("oauthAccount") or {}).get("organizationUuid")
+    if not org_uuid:
+        print("❌ 缺少有效 organizationUuid，请先运行一次 `cc-safe` 完成初始化。")
+        sys.exit(1)
+    cver = get_claude_version()
+
+    out = safe_curl(
+        "https://api.anthropic.com/api/oauth/usage?cedar_ember=1&at_wall=1&offerSurface=cli_menu&skip_spend=1",
+        proxy_url=PROXY_HTTP,
+        timeout=10,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "anthropic-beta": "oauth-2025-04-20",
+            "User-Agent": f"claude-cli/{cver} (external, cli)",
+        },
+    )
+    _mark_banned_on_hold(active_key, out)
+    try:
+        u = json.loads(out)
+    except Exception:
+        print(f"❌ 查询可用重置卡失败: {out[:200]}")
+        sys.exit(1)
+
+    grants = ((u.get("cedar_ember") or {}).get("grants")) or []
+    usable_grant = next((g for g in grants if g.get("resets_left", 0) > 0 and g.get("usable_now")), None)
+    if not usable_grant:
+        reasons = [f"{g.get('id')}: left={g.get('resets_left')}, reason={g.get('unavailable_reason')}" for g in grants]
+        print(f"❌ 当前账号 [{active_key}] 无立即可用的 Reset 卡 ({', '.join(reasons) or '无卡'})。")
+        sys.exit(1)
+
+    req_id = str(uuid.uuid4())
+    payload = json.dumps({"program": "cedar_ember", "grant_id": usable_grant["id"], "request_id": req_id})
+    print(f"🚀 正在为账号 [{active_key}] 使用重置卡 [{usable_grant['id']}]...")
+    claim_out = safe_curl(
+        f"https://api.anthropic.com/api/organizations/{org_uuid}/reset_rate_limits",
+        proxy_url=PROXY_HTTP,
+        timeout=25,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "anthropic-beta": "oauth-2025-04-20",
+            "Content-Type": "application/json",
+            "User-Agent": f"claude-cli/{cver} (external, cli)",
+        },
+        body=payload,
+    )
+    _mark_banned_on_hold(active_key, claim_out)
+    try:
+        res = json.loads(claim_out)
+    except Exception:
+        print(f"❌ 重置接口返回异常: {claim_out[:200]}")
+        sys.exit(1)
+
+    if res.get("result") == "reset":
+        print(f"🎉 重置成功！已清理: {res.get('cleared')} | 剩余卡数: {res.get('resets_left')}\n")
+    else:
+        print(f"⚠️ 重置响应: {json.dumps(res, ensure_ascii=False)}\n")
+    cmd_usage()
+
+
+def cmd_import_session(query: str):
+    data = load_accounts()
+    active_key = data.get("active", "")
+    if not active_key or active_key not in data.get("accounts", {}):
+        print("❌ 当前无有效激活账号。")
+        sys.exit(1)
+    dst_paths = profile_paths(active_key)
+
+    known_emails = {
+        v.get("email", "").strip()
+        for v in (data.get("accounts") or {}).values()
+        if isinstance(v, dict) and v.get("email")
+    }
+
+    search_roots = [os.path.join(HOME, ".claude", "projects")]
+    for k in os.listdir(PROFILES_DIR):
+        if k != active_key and ALIAS_RE.match(k):
+            p = os.path.join(PROFILES_DIR, k, "home", "projects")
+            if os.path.isdir(p):
+                search_roots.append(p)
+
+    matches = []
+    for root in search_roots:
+        for jpath in glob.glob(os.path.join(root, "*", "*.jsonl")):
+            try:
+                if query in os.path.basename(jpath):
+                    matches.append((os.path.getmtime(jpath), jpath))
+                    continue
+                with open(jpath, "r", encoding="utf-8", errors="replace") as jf:
+                    head_chunk = jf.read(20000)
+                if query in head_chunk:
+                    matches.append((os.path.getmtime(jpath), jpath))
+            except Exception:
+                pass
+    if not matches:
+        print(f"❌ 未找到匹配 '{query}' 的历史会话文件。")
+        sys.exit(1)
+
+    matches.sort(reverse=True)
+    _, src_jpath = matches[0]
+    proj_slug = os.path.basename(os.path.dirname(src_jpath))
+    old_sid = os.path.basename(src_jpath)[:-6]
+    new_sid = str(uuid.uuid4())
+    ns_uuid = uuid.UUID(new_sid)
+
+    def map_u(val):
+        if not val or not isinstance(val, str):
+            return val
+        return new_sid if val == old_sid else str(uuid.uuid5(ns_uuid, val))
+
+    strip_types = {
+        "session-owner",
+        "atis-latch",
+        "attribution-snapshot",
+        "api-request",
+        "api-request-blob",
+        "api-request-shape",
+        "cost-state",
+        "credential_org",
+    }
+    email_re = re.compile(r"[a-zA-Z0-9_.+-]+@(?:gmail|googlemail|outlook|hotmail|yahoo|icloud|proton|protonmail|qq|163|claude|anthropic)\.[a-zA-Z0-9-.]+")
+
+    out_lines = []
+    with open(src_jpath, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            s = line.strip()
+            if not s:
+                continue
+            try:
+                obj = json.loads(s)
+            except Exception:
+                continue
+            if not isinstance(obj, dict) or obj.get("type") in strip_types:
+                continue
+            for k_del in ("requestId", "requestRef", "serverClassifierRequest", "accountUuid", "organizationUuid", "userEmail"):
+                obj.pop(k_del, None)
+            if "sessionId" in obj:
+                obj["sessionId"] = new_sid
+            if "session_id" in obj:
+                obj["session_id"] = new_sid
+            for uk in ("uuid", "parentUuid", "leafUuid"):
+                if obj.get(uk):
+                    obj[uk] = map_u(obj[uk])
+
+            att = obj.get("attachment")
+            if isinstance(att, dict) and isinstance(att.get("context"), dict):
+                att["context"].pop("userEmail", None)
+
+            msg = obj.get("message")
+            if isinstance(msg, dict):
+                if msg.get("id"):
+                    msg["id"] = "msg_01" + secrets.token_hex(11)
+                if isinstance(msg.get("content"), list):
+                    cblocks = []
+                    for blk in msg["content"]:
+                        if isinstance(blk, dict):
+                            if blk.get("type") in ("thinking", "redacted_thinking"):
+                                continue
+                            b2 = dict(blk)
+                            b2.pop("signature", None)
+                            cblocks.append(b2)
+                        else:
+                            cblocks.append(blk)
+                    if not cblocks and obj.get("type") == "assistant":
+                        cblocks = [{"type": "text", "text": "(thinking)"}]
+                    msg["content"] = cblocks
+
+            serialized = json.dumps(obj, ensure_ascii=False)
+            for em in known_emails:
+                if em in serialized:
+                    serialized = serialized.replace(em, "[redacted-email]")
+            serialized = email_re.sub("[redacted-email]", serialized)
+            out_lines.append(serialized + "\n")
+
+    dst_proj_dir = os.path.join(dst_paths["projects"], proj_slug)
+    os.makedirs(dst_proj_dir, mode=0o700, exist_ok=True)
+    dst_file = os.path.join(dst_proj_dir, f"{new_sid}.jsonl")
+    atomic_write_text(dst_file, "".join(out_lines), 0o600)
+    print(f"✅ 已深度脱敏并导入会话至当前账号 [{active_key}]:")
+    print(f"   源文件 : {src_jpath}")
+    print(f"   新文件 : {dst_file} (全新 sessionId={new_sid}，已清除旧号邮箱/UUID/签名)")
+
+
+def cmd_set_peer(peer_ip: str):
+    peer_ip = peer_ip.strip()
+    with global_lock(blocking=True):
+        data = load_accounts()
+        if peer_ip in ("none", "off", "clear", ""):
+            data["peers"] = {}
+            data["nodes"] = {}
+            save_accounts(data)
+            print("✅ 已切换为单机运行模式 (已清空 peers/nodes)。")
+            return
+        data.setdefault("peers", {})[HOSTNAME] = peer_ip
+        save_accounts(data)
+        print(f"✅ 已绑定本机 ({HOSTNAME}) 对端主机为: {peer_ip}")
+
+
+def cmd_doctor():
+    print("====================================================================================")
+    print(f"🩺 cc-safe 全维度防封隔离健康自检 — 主机: {HOSTNAME}")
+    print("====================================================================================")
+    issues = 0
+    data = load_accounts()
+    active_key = data.get("active", "")
+    acc = data.get("accounts", {}).get(active_key, {})
+
+    # 1. ~/.claude 中转隔离检查
+    sub_cred = os.path.join(HOME, ".claude", ".credentials.json")
+    sub_cj = os.path.join(HOME, ".claude.json")
+    sub_oa = None
+    if os.path.exists(sub_cj):
+        try:
+            sub_oa = json.load(open(sub_cj, "r", encoding="utf-8")).get("oauthAccount")
+        except Exception:
+            pass
+    if os.path.exists(sub_cred) or sub_oa:
+        print("❌ [1/8] ~/.claude 隔离异常: 检测到残留个人 OAuth 凭证或 oauthAccount！")
+        issues += 1
+    else:
+        print("✅ [1/8] ~/.claude 与 ~/.claude-safe 物理隔离完好 (零个人 OAuth 凭证残留)")
+
+    # 2. ~/.claude-safe 软链接检查
+    bad_links = []
+    for root, dirs, files in os.walk(SAFE_DIR):
+        for name in dirs + files:
+            full = os.path.join(root, name)
+            if os.path.islink(full):
+                bad_links.append(f"{full} -> {os.readlink(full)}")
+    if bad_links:
+        print(f"❌ [2/8] 发现跨目录软链接泄漏: {bad_links}")
+        issues += 1
+    else:
+        print("✅ [2/8] ~/.claude-safe 内零跨目录软链接 (无跨号 projects/sessions 污染)")
+
+    # 3. 各账号指纹互斥性校验
+    seen_uids, seen_mids = {}, {}
+    fp_clash = False
+    for k in data.get("accounts", {}):
+        if not ALIAS_RE.match(k):
+            continue
+        idd = ensure_profile_identity(k)
+        uid, mid = idd["userID"], idd["machineID"]
+        if uid in seen_uids or mid in seen_mids:
+            print(f"❌ [3/8] 指纹撞车: 账号 [{k}] 与已有账号共享 userID 或 machineID！")
+            fp_clash = True
+            issues += 1
+        seen_uids[uid] = k
+        seen_mids[mid] = k
+    if not fp_clash:
+        print(f"✅ [3/8] 全部 {len(seen_uids)} 个账号设备指纹 (userID / machineID / summonSidKey) 100% 互异")
+
+    # 4. 当前激活账号状态
+    if not active_key or not acc:
+        print("❌ [4/8] 当前无有效激活账号 (请运行 `cc-switch add ...` 添加)")
+        issues += 1
+    elif acc.get("status") == "banned":
+        print(f"❌ [4/8] 当前激活账号 [{active_key}] 处于 banned 状态，请切换到可用账号！")
+        issues += 1
+    else:
+        print(f"✅ [4/8] 当前激活账号 [{active_key}] 状态正常 (绑定 IP: {acc.get('ip')})")
+
+    # 5. 双通道隧道出口与 Gost cmdline 零泄密校验
+    exp_ip = acc.get("ip", "")
+    t_http = probe_tunnel_trace(PROXY_HTTP, timeout=6) if exp_ip else {}
+    t_socks = probe_tunnel_trace(PROXY_SOCKS, timeout=6) if exp_ip else {}
+    cmdline_leak = False
+    for pdir in glob.glob("/proc/[0-9]*"):
+        base = os.path.basename(pdir)
+        if not base.isdigit():
+            continue
+        try:
+            if os.stat(pdir).st_uid != os.getuid():
+                continue
+            cmd = open(f"{pdir}/cmdline", "rb").read().decode("utf-8", "ignore")
+            if "gost" in cmd and ("-F\x00" in cmd or "@" in cmd):
+                cmdline_leak = True
+        except Exception:
+            pass
+
+    if cmdline_leak:
+        print("❌ [5/8] 检测到旧版 gost 进程在命令行暴露代理账密，请运行 `cc-us-tunnel restart`！")
+        issues += 1
+    elif exp_ip and t_http.get("ip") == exp_ip and t_socks.get("ip") == exp_ip and t_http.get("loc") == "US":
+        print(f"✅ [5/8] 本机 HTTP(7890) & SOCKS5h(7891) 双通道一致: {exp_ip} (US / {t_http.get('colo')}, 进程零明文凭据)")
+    else:
+        print(f"❌ [5/8] 本机隧道出口不匹配: HTTP={t_http.get('ip')}, SOCKS5h={t_socks.get('ip')}, 预期={exp_ip or '未设置'}")
+        issues += 1
+
+    # 6. proxychains.conf 检查
+    pc_path = os.path.join(HOME, ".local", "etc", "proxychains.conf")
+    pc_txt = open(pc_path, "r", encoding="utf-8").read() if os.path.exists(pc_path) else ""
+    if "strict_chain" in pc_txt and "proxy_dns" in pc_txt and "127.0.0.1 7891" in pc_txt:
+        print("✅ [6/8] proxychains.conf 配置合规 (strict_chain + proxy_dns + 127.0.0.1:7891)")
+    else:
+        print("❌ [6/8] proxychains.conf 缺少 strict_chain 或 proxy_dns！")
+        issues += 1
+
+    # 7. 进程串号与孤儿残留检查
+    rogue_procs = find_cc_safe_processes(only_rogue_for_account=active_key or "__none__")
+    if rogue_procs:
+        rogue_desc = [f"{p['pid']}({p['comm']})" for p in rogue_procs]
+        print(f"❌ [7/8] 发现未绑定当前激活账号的残留/野生订阅进程: {rogue_desc} (可运行 `cc-switch kill` 清理)")
+        issues += 1
+    else:
+        print("✅ [7/8] 本机无串号、孤儿子进程或裸奔的野生订阅 claude 进程")
+
+    # 8. 对端主机一致性与残留进程检查
+    topo_warn = check_topology_warning(data)
+    peer_host = get_peer_host(data)
+    if topo_warn:
+        print(f"❌ [8/8] {topo_warn}")
+        issues += 1
+    elif not peer_host:
+        print("✅ [8/8] 单机运行模式 (未配置对端节点)")
+    else:
+        peer_chk = """
+python3 - <<'PY'
+import importlib.machinery, importlib.util, json, os, subprocess
+h = os.path.expanduser("~")
+sub_c = os.path.exists(h + "/.claude/.credentials.json")
+af = h + "/.claude-safe/config/accounts.json"
+ak = json.load(open(af)).get("active", "NONE") if os.path.exists(af) else "NONE"
+tr = subprocess.run(["curl","-s","-x","http://127.0.0.1:7890","--max-time","5","https://api.anthropic.com/cdn-cgi/trace"], capture_output=True, text=True).stdout
+ip = next((l.split("=")[1] for l in tr.splitlines() if l.startswith("ip=")), "FAIL")
+rogue_cnt = 0
+sw = h + "/.local/bin/cc-switch"
+if os.path.exists(sw):
+    loader = importlib.machinery.SourceFileLoader("cc_switch_mod", sw)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    rogue_cnt = len(mod.find_cc_safe_processes(only_rogue_for_account=ak if ak != "NONE" else "__none__"))
+print(f"{ak}|{ip}|{sub_c}|{rogue_cnt}")
+PY
+"""
+        try:
+            r = subprocess.run(
+                ["ssh", *SSH_BASE_OPTS, peer_host, peer_chk],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            p_ak, p_ip, p_sub, p_rogue = (r.stdout.strip().split("|") + ["", "", "", "0"])[:4]
+            if p_ak == active_key and p_ip == exp_ip and p_sub == "False" and p_rogue == "0":
+                print(f"✅ [8/8] 对端 ({peer_host}) 完全同步一致: active={p_ak}, 出口 IP={p_ip}, ~/.claude 零泄漏, 零异常进程")
+            else:
+                print(
+                    f"❌ [8/8] 对端 ({peer_host}) 状态不一致: active={p_ak}, ip={p_ip}, "
+                    f"sub_cred_leak={p_sub}, rogue_procs={p_rogue}"
+                )
+                issues += 1
+        except Exception as e:
+            print(f"❌ [8/8] 对端 ({peer_host}) SSH 检查失败: {e}")
+            issues += 1
+
+    print("====================================================================================")
+    if issues == 0:
+        print("🟢 [自检通过] 全部 8 项防封隔离指标 100% 绿灯合规！")
+    else:
+        print(f"🔴 [发现隐患] 共检测到 {issues} 项问题，请按上述提示修复！")
+        sys.exit(1)
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("status", "list", "ls"):
+        cmd_status()
+    elif args[0] in ("usage", "quota"):
+        cmd_usage()
+    elif args[0] in ("reset", "limit-reset"):
+        cmd_reset()
+    elif args[0] == "doctor":
+        cmd_doctor()
+    elif args[0] in ("audit", "test-leak"):
+        audit_bin = CC_AUDIT if os.path.exists(CC_AUDIT) else os.path.join(os.path.dirname(os.path.abspath(__file__)), "cc-audit")
+        sys.exit(subprocess.call([audit_bin] + args[1:]))
+    elif args[0] in ("kill", "clean-procs"):
+        cmd_kill()
+    elif args[0] == "kill-local":
+        print(json.dumps(kill_local_cc_safe_tree(), ensure_ascii=False))
+    elif args[0] == "totp":
+        data = load_accounts()
+        ak = args[1] if len(args) >= 2 and not args[1].startswith("-") else data.get("active", "")
+        acc = data.get("accounts", {}).get(ak)
+        if not acc:
+            print(f"❌ 未找到账号 '{ak}'", file=sys.stderr)
+            sys.exit(1)
+        code, rem = gen_totp(acc.get("totp", ""))
+        if "--raw" in args:
+            print(code)
+        else:
+            print(f"{code}  (账号: {ak}, 剩余 {rem}s)")
+    elif args[0] == "pass":
+        data = load_accounts()
+        ak = args[1] if len(args) >= 2 else data.get("active", "")
+        if ak in data.get("accounts", {}):
+            print(data["accounts"][ak]["pass"])
+        else:
+            sys.exit(1)
+    elif args[0] == "check-ip":
+        data = load_accounts()
+        target = args[1] if len(args) >= 2 else data.get("active", "")
+        proxy = data.get("accounts", {}).get(target, {}).get("proxy", target if "://" in target else PROXY_HTTP)
+        chk_env = dict(os.environ)
+        chk_env["CC_CHECK_PROXY_URL"] = proxy
+        sys.exit(subprocess.call([CC_CHECK_IP], env=chk_env))
+    elif args[0] == "ban":
+        if len(args) < 2:
+            print("用法: cc-switch ban <账号别名>")
+            sys.exit(1)
+        ak = validate_alias_or_die(args[1])
+        _enforce_ban_lockdown(ak)
+        print(f"✅ 已将账号 [{ak}] 标记为 banned 并同步封锁。")
+    elif args[0] == "unban":
+        if len(args) < 2:
+            print("用法: cc-switch unban <账号别名>")
+            sys.exit(1)
+        ak = validate_alias_or_die(args[1])
+        with global_lock(blocking=True):
+            data = load_accounts()
+            if ak not in data.get("accounts", {}):
+                print(f"❌ 未找到账号 '{ak}'")
+                sys.exit(1)
+            data["accounts"][ak]["status"] = "active"
+            save_accounts(data)
+            sync_accounts_only_to_peer(get_peer_host(data), stop_peer_tunnel=False)
+        print(f"✅ 已解除账号 [{ak}] 的 banned 状态。")
+    elif args[0] == "set-peer":
+        if len(args) < 2:
+            print("用法: cc-switch set-peer <对端IP | off>")
+            sys.exit(1)
+        cmd_set_peer(args[1])
+    elif args[0] == "import-session":
+        if len(args) < 2:
+            print("用法: cc-switch import-session <标题关键词或UUID>")
+            sys.exit(1)
+        cmd_import_session(args[1])
+    elif args[0] == "apply-local":
+        ak = args[1] if len(args) >= 2 else load_accounts().get("active", "")
+        if ak and ALIAS_RE.match(ak):
+            apply_profile_locally(ak)
+    elif args[0] == "auto-sync":
+        cmd_auto_sync()
+    elif args[0] == "sync-cred":
+        cmd_sync(quiet=("--quiet" in args), cred_only=True)
+    elif args[0] == "sync":
+        cmd_sync(quiet=("--quiet" in args), cred_only=False)
+    elif args[0] == "add":
+        clean_args = [a for a in args[1:] if a != "--force"]
+        if not clean_args:
+            print("用法: cc-switch add '<邮箱----密码----TOTP----sid----代理>' [别名] [--force]  (或 `cc-switch add -` 从标准输入读取)")
+            sys.exit(1)
+        cmd_add(clean_args[0], clean_args[1] if len(clean_args) >= 2 else None, force=("--force" in args))
+    elif args[0] in ("-h", "--help", "help"):
+        cmd_status()
+    else:
+        cmd_switch(args[0], force=("--force" in args))
+
+
+if __name__ == "__main__":
+    main()

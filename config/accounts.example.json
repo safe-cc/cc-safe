@@ -1,0 +1,24 @@
+{
+  "active": "acc1",
+  "nodes": {
+    "host-a": "100.64.0.1",
+    "host-b": "100.64.0.2"
+  },
+  "win_proxy": "100.64.0.1:7890",
+  "expose_tailscale_proxy": true,
+  "accounts": {
+    "acc1": {
+      "id": "acc1",
+      "label": "acc1 (your_account@example.com)",
+      "status": "active",
+      "email": "your_account@example.com",
+      "pass": "YOUR_PASSWORD",
+      "totp": "JBSWY3DPEHPK3PXP",
+      "sid": "",
+      "proxy": "http://username:password@isp-proxy.example.com:10001",
+      "ip": "198.51.100.10",
+      "loc": "Boston, MA (AS6079 RCN)",
+      "tz": "America/New_York"
+    }
+  }
+}

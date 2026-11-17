@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""
+cc-check-ip: Claude Code 代理出口 5 维深度风控体检脚本 (零进程参数泄密)
+- 通过 `curl -K -` 标准输入传递代理账密，杜绝 `ps aux` 暴露密码
+- 覆盖: Anthropic Edge 路由、Scamalytics、IPQS 欺诈分、ipapi 机房穿透、OAuth 接口状态码
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+from urllib.parse import urlsplit
+
+HOME = os.path.expanduser("~")
+os.environ["PATH"] = f"{HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin:" + os.environ.get("PATH", "")
+
+
+def _curl_esc(s: str) -> str:
+    return (s or "").replace("\\", "\\\\").replace('"', '\\"')
+
+
+def safe_curl(url: str, proxy_url: str, timeout: int = 8, method: str = "GET", headers: dict = None, body: str = None, write_code_only: bool = False) -> str:
+    lines = [
+        f'url = "{_curl_esc(url)}"',
+        f'proxy = "{_curl_esc(proxy_url)}"',
+        "location",
+    ]
+    if method != "GET":
+        lines.append(f'request = "{_curl_esc(method)}"')
+    for k, v in (headers or {}).items():
+        lines.append(f'header = "{_curl_esc(f"{k}: {v}")}"')
+    if body is not None:
+        lines.append(f'data = "{_curl_esc(body)}"')
+    cmd = ["curl", "-s", "--max-time", str(timeout)]
+    if write_code_only:
+        cmd += ["-o", "/dev/null", "-w", "%{http_code}"]
+    cmd += ["-K", "-"]
+    res = subprocess.run(cmd, input="\n".join(lines) + "\n", capture_output=True, text=True)
+    return res.stdout
+
+
+def redact_proxy(proxy_url: str) -> str:
+    try:
+        u = urlsplit(proxy_url if "://" in proxy_url else f"http://{proxy_url}")
+        return f"{u.scheme}://{u.hostname or ''}{f':{u.port}' if u.port else ''}"
+    except Exception:
+        return "<redacted>"
+
+
+def detect_claude_ver() -> str:
+    for cand in (os.path.join(HOME, ".local", "bin", "claude"), "claude"):
+        try:
+            r = subprocess.run([cand, "--version"], capture_output=True, text=True, timeout=3)
+            m = re.search(r"(\d+\.\d+\.\d+)", r.stdout or "")
+            if m:
+                return m.group(1)
+        except Exception:
+            continue
+    return "2.1.322"
+
+
+def main():
+    proxy_url = (sys.argv[1] if len(sys.argv) >= 2 else os.environ.get("CC_CHECK_PROXY_URL", "")).strip() or "http://127.0.0.1:7890"
+    if "://" not in proxy_url:
+        proxy_url = f"http://{proxy_url}"
+
+    print("==================================================================")
+    print(f"🛡️  [CC-Check-IP] 正在对代理出口 ({redact_proxy(proxy_url)}) 进行深度风控体检...")
+    print("==================================================================")
+
+    trace_raw = safe_curl("https://api.anthropic.com/cdn-cgi/trace", proxy_url, timeout=8)
+    if not trace_raw.strip():
+        print("❌ [致命失败] 无法通过代理连接 https://api.anthropic.com/cdn-cgi/trace")
+        sys.exit(1)
+
+    trace = {}
+    for line in trace_raw.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            trace[k.strip()] = v.strip()
+
+    ip = trace.get("ip", "")
+    loc = trace.get("loc", "")
+    colo = trace.get("colo", "")
+
+    print(f"1️⃣  [Anthropic 边缘路由] 出口 IP: {ip} | 地区: {loc} | 接入机房: {colo}")
+    if loc != "US" or not ip:
+        print(f"   ❌ 未通过：地区非 US ({loc or '未知'})！")
+    else:
+        print("   ✅ 路由属地 US")
+
+    print("2️⃣  [Scamalytics 欺诈分]")
+    scam_html = safe_curl(f"https://scamalytics.com/ip/{ip}", proxy_url, timeout=8) if ip else ""
+    m_scam = re.search(r"Fraud Score:\s*([0-9]+)", scam_html)
+    scam_score = m_scam.group(1) if m_scam else "N/A"
+    print(f"   Scamalytics Fraud Score: {scam_score} / 100")
+
+    print("3️⃣  [IPQS (IPQualityScore) 严格反欺诈库]")
+    ipqs_raw = safe_curl(f"https://ipinfo.check.place/{ip}?db=ipqualityscore", proxy_url, timeout=10) if ip else ""
+    try:
+        ipqs = json.loads(ipqs_raw) if ipqs_raw.strip() else {}
+        if not isinstance(ipqs, dict):
+            ipqs = {}
+    except Exception:
+        ipqs = {}
+
+    ipqs_score = ipqs.get("fraud_score")
+    ipqs_score_str = str(ipqs_score) if ipqs_score is not None else "N/A"
+    print(f"   IPQS Fraud Score : {ipqs_score_str} / 100 (要求 < 25)")
+    print(f"   IPQS ISP / Org   : {ipqs.get('ISP', 'N/A')} / {ipqs.get('organization', 'N/A')}")
+    print(f"   IPQS 风险标记    : proxy={ipqs.get('proxy', 'N/A')} | vpn={ipqs.get('vpn', 'N/A')} | recent_abuse={ipqs.get('recent_abuse', 'N/A')}")
+
+    print("4️⃣  [ipapi 底层机房/租赁穿透检测]")
+    ipapi_raw = safe_curl(f"https://ipinfo.check.place/{ip}?db=ipapi", proxy_url, timeout=10) if ip else ""
+    try:
+        ipapi = json.loads(ipapi_raw) if ipapi_raw.strip() else {}
+        if not isinstance(ipapi, dict):
+            ipapi = {}
+    except Exception:
+        ipapi = {}
+
+    is_dc = ipapi.get("is_datacenter")
+    is_abuser = ipapi.get("is_abuser")
+    comp = ipapi.get("company") or {}
+    dc = ipapi.get("datacenter") or {}
+    asn = ipapi.get("asn") or {}
+    print(f"   ASN 归属         : {asn.get('org', 'N/A')} (type: {asn.get('type', 'N/A')})")
+    print(f"   实际持有机构     : {comp.get('name', 'N/A')} (type: {comp.get('type', 'N/A')})")
+    print(f"   机房托管标记     : is_datacenter={is_dc if is_dc is not None else 'N/A'} (datacenter: {dc.get('datacenter', 'none')}) | is_abuser={is_abuser if is_abuser is not None else 'N/A'}")
+
+    print("5️⃣  [Anthropic OAuth 接口连通性预检]")
+    cver = detect_claude_ver()
+    oauth_code_str = safe_curl(
+        "https://platform.claude.com/v1/oauth/token",
+        proxy_url,
+        timeout=8,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": f"claude-cli/{cver} (external, cli)",
+        },
+        body='{"grant_type":"refresh_token","refresh_token":"probe","client_id":"9d1c250a-e61b-44d9-88ed-5944d1962f5e"}',
+        write_code_only=True,
+    ).strip() or "000"
+    print(f"   platform.claude.com/v1/oauth/token 状态码: {oauth_code_str} (预期 400 为正常未拦截，403/429/000 为风控或异常)")
+
+    print("==================================================================")
+    ipqs_ok = isinstance(ipqs_score, (int, float)) and ipqs_score < 25
+    dc_ok = is_dc is False and is_abuser is False
+    oauth_ok = oauth_code_str not in ("000", "403", "429")
+
+    if loc == "US" and ip and ipqs_ok and dc_ok and oauth_ok:
+        print(f"🟢 [综合结论] 该 IP ({ip}) 满足全部原生低风险 ISP 标准，可安全绑新号！")
+        sys.exit(0)
+    else:
+        print(
+            f"🔴 [综合警告] 该 IP ({ip or '未知'}) 未通过准入标准 "
+            f"(LOC={loc}, IPQS={ipqs_score_str}, is_datacenter={is_dc}, oauth_http={oauth_code_str})！"
+        )
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,12 @@
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://your-sub2api-relay.example.com",
+    "ANTHROPIC_AUTH_TOKEN": "sk-REPLACE_WITH_YOUR_RELAY_KEY",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
+    "HTTP_PROXY": "",
+    "HTTPS_PROXY": "",
+    "ALL_PROXY": "",
+    "NO_PROXY": "*"
+  }
+}

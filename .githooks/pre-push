@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# pre-push hook: 推送前强制扫描工作区与全量提交历史，严防本机主机名/IP/邮箱/Token 误上传
+set -euo pipefail
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+exec python3 "$REPO_ROOT/bin/cc-audit" --repo-only "$REPO_ROOT"
